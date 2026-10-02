@@ -1,5 +1,7 @@
 pub mod app;
+pub mod cell_commands;
 pub mod config;
+pub mod console;
 pub mod lights;
 pub mod metrics;
 pub mod papyrus_runtime;

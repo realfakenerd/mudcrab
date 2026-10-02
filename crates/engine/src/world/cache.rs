@@ -91,6 +91,18 @@ impl CellCache {
         })
     }
 
+    /// Height of the cell's centre sample (the one the start position and `coc`/`coe` stand on),
+    /// or `None` for a cell with no terrain in the cache.
+    pub fn centre_height(&self, cell_id: u32) -> Option<f32> {
+        let terrain = self.terrain(cell_id)?;
+        let width = usize::from(terrain.width);
+        let height = usize::from(terrain.height);
+        let index = (height / 2)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(width / 2))?;
+        terrain.heights.get(index).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -103,6 +115,36 @@ impl CellCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centre_height_reads_the_centre_sample_and_is_none_without_terrain() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cell_cache.rkyv");
+        let land = |cell_id, side: u16, heights: Vec<f32>| shared::CachedLand {
+            cell_id,
+            width: side,
+            height: side,
+            heights,
+            normals: vec![0; usize::from(side) * usize::from(side) * 3],
+            vertex_colors: vec![255; usize::from(side) * usize::from(side) * 3],
+            layers: vec![],
+            water_height: None,
+            water_type_form_id: None,
+        };
+        let source = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![
+                land(1, 3, vec![0.0, 1.0, 2.0, 3.0, 40.0, 5.0, 6.0, 7.0, 8.0]),
+                land(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            ],
+        };
+        std::fs::write(&path, rkyv::to_bytes::<Error>(&source).unwrap()).unwrap();
+        let cache = CellCache::open(&path).unwrap();
+        assert_eq!(cache.centre_height(1), Some(40.0));
+        // An even-sized grid's centre is index (height / 2) * width + width / 2.
+        assert_eq!(cache.centre_height(2), Some(4.0));
+        assert_eq!(cache.centre_height(99), None);
+    }
 
     #[test]
     fn maps_and_reads_versioned_terrain() {
