@@ -171,9 +171,10 @@ expression: document
       "extras": {
         "openSkyrimCollision": {
           "authored": true,
+          "bodies": [],
           "shapes": [],
           "skipped": [],
-          "version": 1
+          "version": 2
         }
       },
       "nodes": [

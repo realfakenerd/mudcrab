@@ -55,6 +55,7 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
         authored: true,
         shapes: Vec::new(),
         skipped: Vec::new(),
+        bodies: Vec::new(),
     };
     for (index, block) in blocks.iter().enumerate() {
         if block.kind != "bhkCollisionObject" {
