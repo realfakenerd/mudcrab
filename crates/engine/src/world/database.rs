@@ -63,6 +63,27 @@ pub struct ReferenceRow {
     /// The reference's own light radius (`XRDS`), which wins over [`LightRow::radius`]. `None` when
     /// the reference carries no override, and in a database converted before the column existed.
     pub light_radius_override: Option<f32>,
+    /// The reference's `door_links` row, when the database has the table and the reference is a
+    /// load door. `None` for every other reference, and for every reference in a database
+    /// converted before door links were exported.
+    pub door: Option<DoorLinkRow>,
+}
+
+/// A `door_links` row as the world database stores it: where a load door leads, from the door's
+/// `XTEL` subrecord.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoorLinkRow {
+    /// The destination door reference (`XTEL` bytes 0..4, after plugin FormID remapping).
+    pub destination_ref_id: u32,
+    /// The destination reference's cell, `None` when the converter could not resolve it.
+    pub destination_cell_id: Option<u32>,
+    /// The destination reference's worldspace; `None` means the destination is an interior.
+    pub destination_worldspace_id: Option<u32>,
+    /// Arrival position in Creation units (`XTEL` bytes 4..16). Not the destination door's own
+    /// position.
+    pub arrival_position: [f32; 3],
+    /// Arrival rotation in Creation-engine radians (`XTEL` bytes 16..28).
+    pub arrival_rotation: [f32; 3],
 }
 
 /// A `lights` row as the converted database stores it
@@ -409,6 +430,16 @@ const REFERENCE_COLUMNS: &str = "r.id,r.cell_id,r.base_form_id,s.model_path,r.po
 
 const REFERENCE_JOIN: &str = " LEFT JOIN statics s ON s.id=r.base_form_id";
 
+/// The `door_links` row of the reference, in the order [`map_reference`] reads them.
+const DOOR_COLUMNS: &str = "d.destination_ref_id,d.destination_cell_id,d.destination_worldspace_id,\
+     d.pos_x,d.pos_y,d.pos_z,d.rot_x,d.rot_y,d.rot_z";
+
+/// Stand-in for [`DOOR_COLUMNS`] in a database without the `door_links` table: every reference
+/// reads as a non-door, with the column order unchanged.
+const ABSENT_DOOR_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL";
+
+const DOOR_JOIN: &str = " LEFT JOIN door_links d ON d.ref_id=r.id";
+
 /// The `lights` row of the reference's base record, in the order [`map_reference`] reads them.
 const LIGHT_COLUMNS: &str = "l.radius,l.color_r,l.color_g,l.color_b,l.flags";
 
@@ -437,6 +468,17 @@ fn has_records(connection: &Connection) -> Result<bool> {
 fn has_lights(connection: &Connection) -> Result<bool> {
     let count: i64 = connection
         .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='lights'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Whether the database carries the `door_links` table. It is optional: a database converted before
+/// doors were exported still loads, and no reference in it is a load door.
+fn has_door_links(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='door_links'",
+        )?
         .query_row([], |row| row.get(0))?;
     Ok(count > 0)
 }
@@ -476,6 +518,13 @@ impl ReferenceQuery {
         } else {
             ABSENT_RADIUS_OVERRIDE_COLUMN
         };
+        let has_door_links = has_door_links(connection)?;
+        let door_columns = if has_door_links {
+            DOOR_COLUMNS
+        } else {
+            bevy::log::info!("world database has no door_links table; no reference is a load door");
+            ABSENT_DOOR_COLUMNS
+        };
         let mut joins = String::from(REFERENCE_JOIN);
         if has_records {
             joins.push_str(" LEFT JOIN records b ON b.form_id=r.base_form_id");
@@ -483,9 +532,13 @@ impl ReferenceQuery {
         if has_lights {
             joins.push_str(LIGHT_JOIN);
         }
+        if has_door_links {
+            joins.push_str(DOOR_JOIN);
+        }
         Ok(Self {
             columns: format!(
-                "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column}"
+                "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
+                 {door_columns}"
             ),
             joins,
         })
@@ -558,6 +611,34 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         }),
         None => None,
     };
+    let destination_ref_id: Option<u32> = row.get(25)?;
+    let door = match destination_ref_id {
+        Some(destination_ref_id) => {
+            // A row whose arrival point is NULL (a link the converter could not finish) is no
+            // link; it must not fail the cell.
+            let mut arrival = [None::<f32>; 6];
+            for (slot, column) in arrival.iter_mut().zip(28..34) {
+                *slot = row.get(column)?;
+            }
+            if arrival.iter().all(Option::is_some) {
+                let value = |index: usize| arrival[index].unwrap_or_default();
+                Some(DoorLinkRow {
+                    destination_ref_id,
+                    destination_cell_id: row.get(26)?,
+                    destination_worldspace_id: row.get(27)?,
+                    arrival_position: [value(0), value(1), value(2)],
+                    arrival_rotation: [value(3), value(4), value(5)],
+                })
+            } else {
+                bevy::log::debug!(
+                    reference = format_args!("{:08X}", row.get::<_, u32>(0)?),
+                    "door_links row has a NULL arrival position or rotation; the reference is no load door"
+                );
+                None
+            }
+        }
+        None => None,
+    };
     Ok(ReferenceRow {
         form_id: row.get(0)?,
         cell_id: row.get(1)?,
@@ -572,6 +653,7 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         bounds_valid: row.get(17)?,
         light,
         light_radius_override: row.get(24)?,
+        door,
     })
 }
 
@@ -1107,6 +1189,110 @@ mod tests {
             payload.references[0].model_path.as_deref(),
             Some("architecture/wall.nif"),
             "the plain query still joins the base object"
+        );
+    }
+
+    /// A `door_links` table and its rows: reference 30 (exterior cell 10) leads into interior cell
+    /// 500, reference 31 leads out to worldspace 60 and reference 32 is a link whose destination
+    /// the converter could not resolve.
+    fn add_door_links(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                    pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,
+                    rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,
+                    destination_cell_id INTEGER,destination_worldspace_id INTEGER);
+                INSERT INTO "references" VALUES(32,10,20,8260,-12100,50,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(32,8260,8260,-12100,-12100,50,50,10,60);
+                INSERT INTO door_links VALUES(30,700,10.5,-20.25,30,0,0,1.5,500,NULL);
+                INSERT INTO door_links VALUES(31,701,8200,-12200,50,0,0,3.0,10,60);
+                INSERT INTO door_links VALUES(32,702,1,2,3,0,0,0,NULL,NULL);"#,
+            )
+            .unwrap();
+    }
+
+    fn exterior_payload(connection: &Connection) -> CellPayload {
+        load_cell(
+            connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_door_links_row_rides_on_the_reference_row() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        add_door_links(&connection);
+
+        assert!(has_door_links(&connection).unwrap());
+        let payload = exterior_payload(&connection);
+        let door = |form_id: u32| {
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == form_id)
+                .unwrap()
+                .door
+                .clone()
+        };
+        assert_eq!(
+            door(30),
+            Some(DoorLinkRow {
+                destination_ref_id: 700,
+                destination_cell_id: Some(500),
+                destination_worldspace_id: None,
+                arrival_position: [10.5, -20.25, 30.0],
+                arrival_rotation: [0.0, 0.0, 1.5],
+            })
+        );
+        assert_eq!(door(31).unwrap().destination_worldspace_id, Some(60));
+        assert_eq!(door(32).unwrap().destination_cell_id, None);
+        assert_eq!(payload.references.len(), 3);
+    }
+
+    #[test]
+    fn a_door_links_row_with_null_arrival_columns_is_no_link_and_does_not_fail_the_cell() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                    pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,
+                    destination_cell_id INTEGER,destination_worldspace_id INTEGER);
+                INSERT INTO door_links VALUES(30,700,NULL,NULL,NULL,NULL,NULL,NULL,500,NULL);
+                INSERT INTO door_links VALUES(31,701,8200,-12200,50,0,0,NULL,10,60);"#,
+            )
+            .unwrap();
+
+        let payload = exterior_payload(&connection);
+        assert_eq!(payload.references.len(), 2);
+        assert!(
+            payload
+                .references
+                .iter()
+                .all(|reference| reference.door.is_none())
+        );
+    }
+
+    #[test]
+    fn a_database_without_door_links_yields_no_links() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+
+        assert!(!has_door_links(&connection).unwrap());
+        let payload = exterior_payload(&connection);
+        assert_eq!(payload.references.len(), 2);
+        assert!(
+            payload
+                .references
+                .iter()
+                .all(|reference| reference.door.is_none())
         );
     }
 }

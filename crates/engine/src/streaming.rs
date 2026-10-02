@@ -62,6 +62,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
+            .init_resource::<ActiveSpace>()
             .init_resource::<StaticCollisionCache>()
             .add_observer(mark_world_instance_ready)
             .add_systems(
@@ -101,11 +102,38 @@ pub struct StreamingWorld {
 }
 
 impl StreamingWorld {
+    /// The root entity of `key` while it is resident.
+    pub(crate) fn resident_root(&self, key: CellKey) -> Option<Entity> {
+        match self.cells.get(&key) {
+            Some(CellStatus::Resident { root }) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// Whether the load of `key` failed.
+    pub(crate) fn is_failed(&self, key: CellKey) -> bool {
+        matches!(self.cells.get(&key), Some(CellStatus::Failed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resident_for_test(&mut self, key: CellKey, root: Entity) {
+        self.cells.insert(key, CellStatus::Resident { root });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failed_for_test(&mut self, key: CellKey) {
+        self.cells.insert(key, CellStatus::Failed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_count_for_test(&self) -> usize {
+        self.cells.len()
+    }
+
     /// Submits one load for `key` unless it is already loading or resident, and records the
     /// request on the streaming metrics. This is the loader path every cell goes through, however
     /// the request is driven: the camera planner streams exteriors from it, and the streaming
-    /// fixture loads an interior from it by id, because this tree has no runtime path that
-    /// switches the active space to an interior on its own.
+    /// fixture and a load-door crossing load an interior from it by id.
     pub(crate) fn request_cell(
         &mut self,
         database: &WorldDatabase,
@@ -289,7 +317,7 @@ struct AuthoredColliderPart {
 }
 
 #[derive(Resource, Default)]
-struct TerrainContinuity {
+pub(crate) struct TerrainContinuity {
     edges: HashMap<CellKey, TerrainEdges>,
 }
 
@@ -412,11 +440,99 @@ enum CellStatus {
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct RenderOrigin(pub IVec2);
 
+/// The space the player is in. The planner streams only this space: the active interior when
+/// there is one, otherwise the exterior cells around the camera in the active worldspace. A load
+/// door crossing (`crate::door_crossing`) changes it; nothing else does, so the default (no
+/// interior, the configured worldspace) is the behaviour before doors existed.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActiveSpace {
+    /// `None` means the worldspace the engine was configured with.
+    pub worldspace_id: Option<u32>,
+    /// `Some(cell_id)` while the player is inside that interior cell.
+    pub interior: Option<u32>,
+}
+
+impl ActiveSpace {
+    pub fn exterior_worldspace(&self, configured: u32) -> u32 {
+        self.worldspace_id.unwrap_or(configured)
+    }
+}
+
+/// The cells the planner wants resident: the active interior alone, or the exterior window of
+/// `radius` cells around `center` in the active worldspace.
+fn wanted_cells(
+    space: &ActiveSpace,
+    configured_worldspace: u32,
+    center: IVec2,
+    radius: i32,
+) -> HashSet<CellKey> {
+    if let Some(cell_id) = space.interior {
+        return HashSet::from([CellKey::Interior(cell_id)]);
+    }
+    let worldspace_id = space.exterior_worldspace(configured_worldspace);
+    let mut wanted = HashSet::new();
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            wanted.insert(CellKey::Exterior {
+                worldspace_id,
+                grid_x: center.x + x,
+                grid_y: center.y + y,
+            });
+        }
+    }
+    wanted
+}
+
+/// Whether a loaded cell belongs to the active space at all. A cell of another space (left behind
+/// by a crossing) is outside it whatever its grid square.
+fn cell_in_active_space(key: CellKey, space: &ActiveSpace, configured_worldspace: u32) -> bool {
+    match key {
+        CellKey::Exterior { worldspace_id, .. } => {
+            space.interior.is_none()
+                && worldspace_id == space.exterior_worldspace(configured_worldspace)
+        }
+        CellKey::Interior(cell_id) => space.interior.is_none_or(|active| active == cell_id),
+    }
+}
+
+/// Unloads every cell at once, unpaced: the space the player left must not be drawn or collide
+/// for another frame. Entries still loading are dropped, so their responses turn stale.
+pub(crate) fn unload_all_cells_now(world: &mut World) -> usize {
+    let started = Instant::now();
+    let cells: Vec<(CellKey, CellStatus)> = world
+        .resource_mut::<StreamingWorld>()
+        .cells
+        .drain()
+        .collect();
+    let mut entities = 0usize;
+    let mut unloaded = 0u64;
+    for (key, status) in &cells {
+        if let CellStatus::Resident { root } | CellStatus::Retiring { root } = status {
+            entities = entities.saturating_add(despawn_subtree(world, *root));
+            unloaded += 1;
+        }
+        world.resource_mut::<TerrainContinuity>().edges.remove(key);
+    }
+    {
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(unloaded);
+        metrics.despawned_entities = metrics.despawned_entities.saturating_add(entities as u64);
+        metrics.resident_cells = 0;
+        metrics.loading_cells = 0;
+        metrics.retiring_cells = 0;
+    }
+    let mut profiler = world.resource_mut::<ProfilingState>();
+    profiler.record_elapsed("streaming/space_switch_unload", started);
+    profiler.increment("streaming/despawned_cells", unloaded);
+    cells.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_cells(
     config: Res<EngineConfig>,
     database: Res<WorldDatabase>,
     origin: Res<RenderOrigin>,
+    space: Res<ActiveSpace>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut streaming: ResMut<StreamingWorld>,
     mut continuity: ResMut<TerrainContinuity>,
@@ -437,16 +553,7 @@ fn plan_cells(
     } else {
         streaming_center(camera.translation, origin.0)
     };
-    let mut wanted = HashSet::new();
-    for y in -config.stream_radius..=config.stream_radius {
-        for x in -config.stream_radius..=config.stream_radius {
-            wanted.insert(CellKey::Exterior {
-                worldspace_id: config.worldspace_id,
-                grid_x: center.x + x,
-                grid_y: center.y + y,
-            });
-        }
-    }
+    let wanted = wanted_cells(&space, config.worldspace_id, center, config.stream_radius);
     for key in &wanted {
         // A retiring cell is still in the map, so `request_cell` never requests it a second time:
         // the retain pass below revives it with the root it kept.
@@ -454,7 +561,9 @@ fn plan_cells(
     }
     let mut revived = 0u64;
     streaming.cells.retain(|key, status| {
-        if cell_within_unload_radius(*key, center, config.unload_radius) {
+        if cell_in_active_space(*key, &space, config.worldspace_id)
+            && cell_within_unload_radius(*key, center, config.unload_radius)
+        {
             if let CellStatus::Retiring { root } = status {
                 *status = CellStatus::Resident { root: *root };
                 revived += 1;
@@ -826,8 +935,8 @@ pub(crate) fn streaming_center(translation: Vec3, origin: IVec2) -> IVec2 {
 }
 
 /// Whether a loaded cell stays loaded. Exteriors fall out of the radius the camera carries; an
-/// interior has no grid square to fall out of, so it stays until something unloads it, and no
-/// runtime path unloads one yet.
+/// interior has no grid square to fall out of, so it stays until something unloads it (a load door
+/// crossing unloads every cell of the space it leaves, see [`unload_all_cells_now`]).
 fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
     match key {
         CellKey::Exterior { grid_x, grid_y, .. } => {
@@ -1055,6 +1164,10 @@ fn spawn_cell(
                     // `LIGHT_LAYERS` so it reaches the world layer and both cameras.
                     crate::render::light_render_layers(),
                 ));
+            }
+            if let Some(door) = crate::doors::load_door(reference.form_id, reference.door.as_ref())
+            {
+                entity.insert(door);
             }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
                 let sequence = *model_sequence;
@@ -1451,6 +1564,47 @@ struct PendingTerrainProfile {
 struct PendingWaterProfile {
     cell_id: u32,
     flow_normal: Option<Handle<Image>>,
+}
+
+/// Counts the streamer's unfinished-work markers under one cell root: a model not yet armed or
+/// instantiated, and terrain or water whose textures are still loading. Unlike the global
+/// [`StreamingMetrics`] counts these cover only that cell, which is what a load door waits for.
+#[derive(bevy::ecs::system::SystemParam)]
+#[allow(clippy::type_complexity)]
+pub(crate) struct PendingUnder<'w, 's> {
+    children: Query<'w, 's, &'static Children>,
+    pending: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            With<PendingModel>,
+            With<PendingAssetProfile>,
+            With<PendingTerrainProfile>,
+            With<PendingWaterProfile>,
+        )>,
+    >,
+}
+
+impl PendingUnder<'_, '_> {
+    /// How many entities at or under `root` still carry an unfinished-work marker.
+    pub(crate) fn count(&self, root: Entity) -> usize {
+        std::iter::once(root)
+            .chain(self.children.iter_descendants(root))
+            .filter(|entity| self.pending.contains(*entity))
+            .count()
+    }
+}
+
+/// A pending-work marker for tests in other modules: terrain whose textures are still loading.
+#[cfg(test)]
+pub(crate) fn pending_marker_for_test() -> impl Bundle {
+    PendingTerrainProfile {
+        cell_id: 0,
+        quadrant: 0,
+        images: Vec::new(),
+        normals: Vec::new(),
+    }
 }
 
 type RenderPrimitiveQuery<'world, 'state> = Query<
@@ -2526,13 +2680,13 @@ fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
     }
 }
 
-fn creation_to_bevy(position: Vec3) -> Vec3 {
+pub(crate) fn creation_to_bevy(position: Vec3) -> Vec3 {
     Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
         position.to_array(),
     ))
 }
 
-fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
+pub(crate) fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
         rotation,
     ))
@@ -3068,6 +3222,7 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_render_origin(
     config: Res<EngineConfig>,
+    space: Res<ActiveSpace>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<
@@ -3095,6 +3250,11 @@ fn update_render_origin(
     // artistically offset camera would drag the streamed window (and the
     // screenshot target's cells) away from the framed view.
     if config.acceptance_screenshot.is_some() {
+        return;
+    }
+    // An interior is placed in absolute coordinates around the origin it was entered with, so the
+    // origin stays put while the player is inside one; leaving it sets the origin afresh.
+    if space.interior.is_some() {
         return;
     }
     let started = Instant::now();
@@ -3891,6 +4051,7 @@ mod tests {
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<ActiveSpace>()
             .init_resource::<ProfilingState>()
             .add_systems(
                 Update,
@@ -4149,6 +4310,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveSpace>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
@@ -4190,6 +4352,7 @@ mod tests {
         let mut app = crate::physics::headless::fixture_app();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveSpace>()
             .add_systems(Update, update_render_origin);
         let cell = app
             .world_mut()
@@ -4275,6 +4438,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveSpace>()
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
@@ -4778,6 +4942,7 @@ mod tests {
         .init_resource::<StreamingMetrics>()
         .init_resource::<StreamingWorld>()
         .init_resource::<TerrainContinuity>()
+        .init_resource::<ActiveSpace>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
         .init_resource::<SceneSpawnBatch>()
@@ -5017,6 +5182,7 @@ mod tests {
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveSpace>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .add_systems(Update, spawn_test_cell);
         app.update();
@@ -5143,6 +5309,7 @@ mod tests {
                     bounds_valid: false,
                     light: None,
                     light_radius_override: None,
+                    door: None,
                 }],
             },
             Some(terrain),
@@ -5964,6 +6131,7 @@ mod tests {
             bounds_valid: false,
             light,
             light_radius_override: radius_override,
+            door: None,
         }
     }
 
@@ -6045,6 +6213,7 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveSpace>()
             .insert_resource(AssetCatalog::open(&path).unwrap())
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedReferences(references))
@@ -6074,6 +6243,46 @@ mod tests {
                     .is_some_and(|id| id.0 == form_id)
             })
             .expect("the reference spawned")
+    }
+
+    /// A spawned reference with a resolvable `door_links` row carries `LoadDoor`; one whose link
+    /// cannot be resolved, and a plain reference, do not.
+    #[test]
+    fn a_spawned_door_reference_carries_load_door() {
+        let link = |cell| crate::world::database::DoorLinkRow {
+            destination_ref_id: 0x700,
+            destination_cell_id: cell,
+            destination_worldspace_id: None,
+            arrival_position: [10.0, 20.0, 30.0],
+            arrival_rotation: [0.0, 0.0, 1.0],
+        };
+        let mut door = lit_reference(0x110, None, None);
+        door.door = Some(link(Some(500)));
+        let mut unresolved = lit_reference(0x111, None, None);
+        unresolved.door = Some(link(None));
+        let app = spawn_reference_cell_app(
+            vec![door, unresolved, lit_reference(0x112, None, None)],
+            false,
+        );
+
+        let loaded = app
+            .world()
+            .entity(reference_entity(&app, 0x110))
+            .get::<crate::doors::LoadDoor>()
+            .cloned()
+            .expect("the door reference carries LoadDoor");
+        assert_eq!(loaded.ref_id, 0x110);
+        assert_eq!(loaded.destination.destination_ref_id, 0x700);
+        assert_eq!(loaded.destination.interior_cell_id, Some(500));
+        assert_eq!(loaded.destination.arrival_position, [10.0, 20.0, 30.0]);
+        for form_id in [0x111, 0x112] {
+            assert!(
+                app.world()
+                    .entity(reference_entity(&app, form_id))
+                    .get::<crate::doors::LoadDoor>()
+                    .is_none()
+            );
+        }
     }
 
     /// One lit reference, one negative light, one flagged off by default and one plain reference:

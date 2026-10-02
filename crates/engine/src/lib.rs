@@ -1,5 +1,7 @@
 pub mod app;
 pub mod config;
+pub mod door_crossing;
+pub mod doors;
 pub mod lights;
 pub mod metrics;
 pub mod papyrus_runtime;
