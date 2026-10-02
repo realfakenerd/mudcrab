@@ -13,9 +13,12 @@ use project_wormhole_nif::{
     nif_block::{NiAVObject, NifBlock},
     nif_file::NifFile,
 };
-use project_wormhole_shared::glam::{Mat4, Quat, Vec3};
+use project_wormhole_shared::glam::{Mat3, Mat4, Quat, Vec3};
 use shared::{
-    collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape},
+    collision::{
+        BodyKind, COLLISION_ASSET_VERSION, CollisionAsset, CollisionBody, CollisionShape,
+        HavokBodyInfo,
+    },
     coordinates::creation_to_runtime_vector,
 };
 use std::{fs, path::Path};
@@ -23,6 +26,10 @@ use std::{fs, path::Path};
 const HAVOK_TO_CREATION: f32 = 70.0;
 const MAX_VERTICES: usize = 1_000_000;
 const MAX_SHAPES: usize = 256;
+/// `bhkMultiSphereShape` bounds (`Num Spheres` range 1:8 in niftools nif.xml).
+const MAX_SPHERES: usize = 8;
+/// Points per ring when a cylinder becomes a hull of two rings.
+const CYLINDER_RING_POINTS: usize = 16;
 
 struct Block<'a> {
     kind: &'a str,
@@ -55,6 +62,7 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
         authored: true,
         shapes: Vec::new(),
         skipped: Vec::new(),
+        bodies: Vec::new(),
     };
     for (index, block) in blocks.iter().enumerate() {
         if block.kind != "bhkCollisionObject" {
@@ -76,14 +84,25 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
                 .bytes
                 .get(4)
                 .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))?;
-            // Skyrim uses layer 15 for harvestable flora and other nonphysical objects.
+            // `SkyrimLayer` values, from niftools nif.xml: 0 UNIDENTIFIED, 1 STATIC, 2 ANIMSTATIC,
+            // 3 TRANSPARENT, 4 CLUTTER, 5 WEAPON, 9 TREES, 10 PROPS, 12 TRIGGER, 13 TERRAIN,
+            // 15 NONCOLLIDABLE, 17 GROUND, 26 TRANSPARENT_SMALL, 27 INVISIBLE_WALL,
+            // 28 TRANSPARENT_SMALL_ANIM, 31 STAIRHELPER, 35 COLLISIONBOX.
+            // 15 is harvestable flora and other nonphysical objects; 12 is a trigger volume.
             if layer == 15 {
                 return Ok(());
             }
+            if layer == 12 {
+                bail!("trigger volume (layer 12) is not physical");
+            }
             ensure!(
-                matches!(layer, 1 | 2 | 3 | 4 | 9 | 10 | 13 | 17 | 27 | 31 | 35),
+                matches!(
+                    layer,
+                    0 | 1 | 2 | 3 | 4 | 5 | 9 | 10 | 13 | 17 | 26 | 27 | 28 | 31 | 35
+                ),
                 "unsupported collision layer {layer}"
             );
+            ensure_body_collides(body_block.bytes)?;
             let node = target_transform(nif, &blocks, target)?;
             let shape = usize::try_from(u32_at(body_block.bytes, 0)?)?;
             let body_transform = if body_block.kind == "bhkRigidBodyT" {
@@ -93,13 +112,242 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
             } else {
                 Mat4::IDENTITY
             };
-            extract_shape(&blocks, shape, node * body_transform, &mut asset.shapes, 0)
+            let first_shape = asset.shapes.len();
+            let frame = node * body_transform;
+            extract_shape(&blocks, shape, frame, &mut asset.shapes, 0)?;
+            // The shapes stay even when the dynamics cannot be read: a fixed collider is
+            // still correct, only the physics body is lost (and reported).
+            let body = rigid_body(
+                nif,
+                target,
+                body_block.bytes,
+                frame,
+                u32::try_from(first_shape)?..u32::try_from(asset.shapes.len())?,
+                &asset.shapes,
+            );
+            match body {
+                Ok(body) => asset.bodies.push(body),
+                Err(error) => asset.skipped.push(format!(
+                    "block {index}: rigid body {body}: {error:#}",
+                    body = body_block.kind
+                )),
+            }
+            Ok(())
         })();
         if let Err(error) = outcome {
             asset.skipped.push(format!("block {index}: {error:#}"));
         }
     }
     Ok(asset)
+}
+
+// Havok enum values of `bhkRigidBodyCInfo2010`, from niftools nif.xml.
+//
+// hkMotionType (`Motion System`): 0 MO_SYS_INVALID, 1 MO_SYS_DYNAMIC, 2 MO_SYS_SPHERE_INERTIA,
+// 3 MO_SYS_SPHERE_STABILIZED, 4 MO_SYS_BOX_INERTIA, 5 MO_SYS_BOX_STABILIZED, 6 MO_SYS_KEYFRAMED,
+// 7 MO_SYS_FIXED, 8 MO_SYS_THIN_BOX, 9 MO_SYS_CHARACTER.
+// hkQualityType (`Quality Type`): 0 MO_QUAL_INVALID, 1 MO_QUAL_FIXED, 2 MO_QUAL_KEYFRAMED,
+// 3 MO_QUAL_DEBRIS, 4 MO_QUAL_MOVING, 5 MO_QUAL_CRITICAL, 6 MO_QUAL_BULLET, 7 MO_QUAL_USER,
+// 8 MO_QUAL_CHARACTER, 9 MO_QUAL_KEYFRAMED_REPORT.
+// hkDeactivatorType (`Deactivator Type`): 0 DEACTIVATOR_INVALID, 1 DEACTIVATOR_NEVER,
+// 2 DEACTIVATOR_SPATIAL. It is kept raw and does not take part in `kind`.
+
+/// Motion systems that integrate a body under forces: dynamic, sphere/box inertia (plain and
+/// stabilized) and thin box. Keyframed, fixed, character and invalid are not simulated.
+const SIMULATED_MOTION_SYSTEMS: [u8; 6] = [1, 2, 3, 4, 5, 8];
+const MOTION_SYSTEM_KEYFRAMED: u8 = 6;
+/// Qualities of a body that moves and collides: debris, moving, critical, bullet.
+const MOVING_QUALITY_TYPES: [u8; 4] = [3, 4, 5, 6];
+
+// Byte offsets inside a `bhkRigidBody`/`bhkRigidBodyT` block (Skyrim SE, BS version 100):
+// `bhkWorldObject` (shape 0, filter 4, world-object info 8..28), `bhkEntityCInfo` (28..32),
+// then `bhkRigidBodyCInfo2010` from 32. The translation at 52 anchors the whole layout.
+const BODY_LAYER: usize = 4;
+const BODY_INERTIA: usize = 116; // hkMatrix3: three rows of four floats, the fourth unused
+const BODY_CENTER: usize = 164; // Vector4, w unused
+const BODY_MASS: usize = 180;
+const BODY_LINEAR_DAMPING: usize = 184;
+const BODY_ANGULAR_DAMPING: usize = 188;
+const BODY_FRICTION: usize = 200;
+const BODY_RESTITUTION: usize = 208;
+const BODY_MAX_LINEAR_VELOCITY: usize = 212;
+const BODY_MAX_ANGULAR_VELOCITY: usize = 216;
+const BODY_MOTION_SYSTEM: usize = 224;
+const BODY_DEACTIVATOR_TYPE: usize = 225;
+const BODY_QUALITY_TYPE: usize = 227;
+const BODY_MIN_LEN: usize = 228;
+
+/// Classifies a body from its raw Havok values (#104: motion system AND quality AND mass).
+fn classify(motion_system: u8, quality_type: u8, mass: f32) -> BodyKind {
+    if SIMULATED_MOTION_SYSTEMS.contains(&motion_system)
+        && MOVING_QUALITY_TYPES.contains(&quality_type)
+        && mass.is_finite()
+        && mass > 0.0
+    {
+        BodyKind::Dynamic
+    } else if motion_system == MOTION_SYSTEM_KEYFRAMED && mass == 0.0 {
+        BodyKind::Keyframed
+    } else {
+        BodyKind::Fixed
+    }
+}
+
+/// glTF node index the exporter gives a NIF block: the static scene writes one node per
+/// `NiNode`, `BSFadeNode` and geometry block, in block order. The converter re-checks this
+/// against the model it exported (`mesh.rs`).
+fn gltf_node_index(nif: &NifFile, target: usize) -> Result<u32> {
+    fn exported(block: &NifBlock) -> bool {
+        matches!(
+            block,
+            NifBlock::NiNode(_)
+                | NifBlock::BSFadeNode(_)
+                | NifBlock::BSTriShape(_)
+                | NifBlock::BSDynamicTriShape(_)
+                | NifBlock::BSSubIndexTriShape(_)
+                | NifBlock::BSLODTriShape(_)
+                | NifBlock::NiTriShape(_)
+        )
+    }
+    ensure!(
+        nif.blocks.get(target).is_some_and(exported),
+        "collision target {target} is not exported as a glTF node"
+    );
+    Ok(u32::try_from(
+        nif.blocks[..target]
+            .iter()
+            .filter(|block| exported(block))
+            .count(),
+    )?)
+}
+
+fn node_name(nif: &NifFile, target: usize) -> String {
+    let name = match nif.blocks.get(target) {
+        Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => node.av.object.name,
+        _ => return String::new(),
+    };
+    nif.header
+        .get_string(name as usize)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// Reads one rigid body's dynamics into the frame of the shapes it owns. `frame` is the
+/// Creation-space transform applied to the shapes (target node x `bhkRigidBodyT` transform);
+/// the tensor is rotated by its rotation, the centre of mass moved by all of it, and both then
+/// take the same Creation-to-runtime basis the shapes get.
+fn rigid_body(
+    nif: &NifFile,
+    target: usize,
+    bytes: &[u8],
+    frame: Mat4,
+    shape_range: std::ops::Range<u32>,
+    shapes: &[CollisionShape],
+) -> Result<CollisionBody> {
+    ensure!(!shape_range.is_empty(), "rigid body owns no shapes");
+    let owned = shapes
+        .get(shape_range.start as usize..shape_range.end as usize)
+        .ok_or_else(|| color_eyre::eyre::eyre!("rigid body shape range out of bounds"))?;
+    let mut body = read_dynamics(bytes, frame, owned)?;
+    body.node = gltf_node_index(nif, target)?;
+    body.target = node_name(nif, target);
+    body.shapes = shape_range.collect();
+    Ok(body)
+}
+
+/// The dynamics fields of a rigid-body block, converted into the shapes' frame. `node`,
+/// `target` and `shapes` are filled in by [`rigid_body`]. Every converted value is checked
+/// for finiteness after the unit conversion, since a large finite Havok value overflows
+/// when multiplied by 70.
+fn read_dynamics(bytes: &[u8], frame: Mat4, owned: &[CollisionShape]) -> Result<CollisionBody> {
+    ensure!(bytes.len() >= BODY_MIN_LEN, "short rigid body");
+    let (motion_system, deactivator_type, quality_type) = (
+        bytes[BODY_MOTION_SYSTEM],
+        bytes[BODY_DEACTIVATOR_TYPE],
+        bytes[BODY_QUALITY_TYPE],
+    );
+    let scalar = |offset: usize| -> Result<f32> {
+        let value = f32_at(bytes, offset)?;
+        ensure!(value.is_finite(), "non-finite rigid body value");
+        Ok(value)
+    };
+    let mass = scalar(BODY_MASS)?;
+    ensure!(mass >= 0.0, "negative rigid body mass");
+    let mut local = [0.0_f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            local[row * 3 + column] = scalar(BODY_INERTIA + row * 16 + column * 4)?;
+        }
+    }
+    let center = vec3_at(bytes, BODY_CENTER)? * HAVOK_TO_CREATION;
+    ensure!(
+        center.is_finite(),
+        "rigid body centre of mass overflows after unit conversion"
+    );
+
+    let scale = frame.x_axis.truncate().length();
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid rigid body transform scale"
+    );
+    let rotation = Mat3::from_cols(
+        frame.x_axis.truncate() / scale,
+        frame.y_axis.truncate() / scale,
+        frame.z_axis.truncate() / scale,
+    );
+    let runtime_basis = Mat3::from_cols(
+        Vec3::from(creation_to_runtime_vector([1.0, 0.0, 0.0])),
+        Vec3::from(creation_to_runtime_vector([0.0, 1.0, 0.0])),
+        Vec3::from(creation_to_runtime_vector([0.0, 0.0, 1.0])),
+    );
+    // `from_cols_array` takes the row-major values as columns, so transpose to get the tensor.
+    let tensor = Mat3::from_cols_array(&local).transpose();
+    let basis = runtime_basis * rotation;
+    let tensor = basis
+        * (tensor * (HAVOK_TO_CREATION * HAVOK_TO_CREATION * scale * scale))
+        * basis.transpose();
+    let mut inertia = [0.0_f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            // Symmetrised: the contract is a symmetric tensor even if the file is not.
+            inertia[row * 3 + column] = 0.5 * (tensor.col(column)[row] + tensor.col(row)[column]);
+        }
+    }
+    ensure!(
+        inertia.iter().all(|value| value.is_finite()),
+        "rigid body inertia overflows after unit conversion"
+    );
+    let center_of_mass = point(frame, center)?;
+    let max_linear_velocity = scalar(BODY_MAX_LINEAR_VELOCITY)? * HAVOK_TO_CREATION;
+    ensure!(
+        max_linear_velocity.is_finite(),
+        "rigid body max linear velocity overflows after unit conversion"
+    );
+    let convex = !owned.is_empty()
+        && owned
+            .iter()
+            .all(|shape| !matches!(shape, CollisionShape::Mesh { .. }));
+    Ok(CollisionBody {
+        node: 0,
+        target: String::new(),
+        shapes: Vec::new(),
+        kind: classify(motion_system, quality_type, mass),
+        havok: HavokBodyInfo {
+            motion_system,
+            quality_type,
+            deactivator_type,
+            collision_layer: bytes[BODY_LAYER],
+        },
+        mass,
+        inertia,
+        center_of_mass,
+        linear_damping: scalar(BODY_LINEAR_DAMPING)?,
+        angular_damping: scalar(BODY_ANGULAR_DAMPING)?,
+        friction: scalar(BODY_FRICTION)?,
+        restitution: scalar(BODY_RESTITUTION)?,
+        max_linear_velocity,
+        max_angular_velocity: scalar(BODY_MAX_ANGULAR_VELOCITY)?,
+        convex,
+    })
 }
 
 fn target_transform(nif: &NifFile, blocks: &[Block<'_>], target: usize) -> Result<Mat4> {
@@ -249,8 +497,99 @@ fn extract_shape(
             out.push(CollisionShape::Capsule {
                 a: point(transform, a * HAVOK_TO_CREATION)?,
                 b: point(transform, b * HAVOK_TO_CREATION)?,
-                radius: radius * HAVOK_TO_CREATION * scale,
+                radius: runtime_radius(radius, scale)?,
             });
+            Ok(())
+        }
+        // `bhkSphereShape` (bhkConvexShape): material @0, shell radius @4; the centre is the
+        // shape origin.
+        "bhkSphereShape" => {
+            ensure!(block.bytes.len() >= 8, "short sphere");
+            let radius = f32_at(block.bytes, 4)?;
+            ensure!(radius.is_finite() && radius > 0.0, "invalid sphere radius");
+            let scale = uniform_scale(transform, "sphere")?;
+            // The engine builds a capsule with `Collider::capsule(a, b, radius)`; a == b is a
+            // zero-length segment, i.e. a sphere (parry3d stores the segment without normalising
+            // it, and its distance and mass-property code handle a zero-length segment).
+            let center = point(transform, Vec3::ZERO)?;
+            out.push(CollisionShape::Capsule {
+                a: center,
+                b: center,
+                radius: runtime_radius(radius, scale)?,
+            });
+            Ok(())
+        }
+        // `bhkCylinderShape`: material @0, shell radius @4, unused 8, vertex A Vector4 @16,
+        // vertex B Vector4 @32, cylinder radius @48 (12 more unused bytes follow in nif.xml).
+        "bhkCylinderShape" => {
+            ensure!(block.bytes.len() >= 52, "short cylinder");
+            let a = vec3_at(block.bytes, 16)?;
+            let b = vec3_at(block.bytes, 32)?;
+            let radius = f32_at(block.bytes, 48)?;
+            ensure!(
+                radius.is_finite() && radius > 0.0,
+                "invalid cylinder radius"
+            );
+            let scale = transform.transform_vector3(Vec3::X).length();
+            ensure!(
+                scale.is_finite() && scale > 0.0,
+                "invalid cylinder transform scale"
+            );
+            let axis = b - a;
+            let length = axis.length();
+            ensure!(
+                length.is_finite() && length > 1.0e-6,
+                "degenerate cylinder axis"
+            );
+            let axis = axis / length;
+            // A stable pair of unit axes perpendicular to the cylinder axis.
+            let helper = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+            let u = (helper - axis * helper.dot(axis)).normalize();
+            let v = axis.cross(u);
+            let mut points = Vec::with_capacity(CYLINDER_RING_POINTS * 2);
+            for end in [a, b] {
+                for index in 0..CYLINDER_RING_POINTS {
+                    let angle = index as f32 / CYLINDER_RING_POINTS as f32 * std::f32::consts::TAU;
+                    let offset = (u * angle.cos() + v * angle.sin()) * radius;
+                    points.push(point(transform, (end + offset) * HAVOK_TO_CREATION)?);
+                }
+            }
+            out.push(CollisionShape::Hull { points });
+            Ok(())
+        }
+        // `bhkMultiSphereShape`: material @0, bhkWorldObjCInfoProperty (12 bytes) @4, sphere
+        // count u32 @16, then NiBound { centre Vector3, radius f32 } x n from @20.
+        "bhkMultiSphereShape" => {
+            ensure!(block.bytes.len() >= 20, "short multi-sphere shape");
+            let count = usize::try_from(u32_at(block.bytes, 16)?)?;
+            ensure!(
+                (1..=MAX_SPHERES).contains(&count),
+                "invalid multi-sphere count"
+            );
+            ensure!(
+                block.bytes.len() >= 20 + count * 16,
+                "short multi-sphere data"
+            );
+            ensure!(
+                out.len() + count <= MAX_SHAPES,
+                "collision shape size limit"
+            );
+            let scale = uniform_scale(transform, "multi-sphere")?;
+            for index in 0..count {
+                let center = vec3_at(block.bytes, 20 + index * 16)?;
+                let radius = f32_at(block.bytes, 32 + index * 16)?;
+                ensure!(
+                    radius.is_finite() && radius > 0.0,
+                    "invalid multi-sphere radius"
+                );
+                // One sphere-capsule per bound, like `bhkSphereShape`.
+                let center = point(transform, center * HAVOK_TO_CREATION)?;
+                out.push(CollisionShape::Capsule {
+                    a: center,
+                    b: center,
+                    radius: runtime_radius(radius, scale)?,
+                });
+            }
             Ok(())
         }
         "bhkBoxShape" => {
@@ -575,6 +914,66 @@ fn decode_ni_tri_strips(bytes: &[u8], transform: Mat4) -> Result<CollisionShape>
     })
 }
 
+/// Rejects a rigid body that blocks nothing. A Skyrim body stores its `HavokFilter` and
+/// collision response twice: in `bhkWorldObject`/`bhkEntityCInfo` (filter flags @5, response
+/// @28) and again in `bhkRigidBodyCInfo2010` (filter flags @37, response @48). Either copy
+/// flagging `CollisionFilterFlags` 0x40 "No Collision", or an `hkResponseType` of
+/// 2 RESPONSE_REPORTING or 3 RESPONSE_NONE (no contacts resolved), rejects the body.
+fn ensure_body_collides(bytes: &[u8]) -> Result<()> {
+    let byte = |offset: usize| {
+        bytes
+            .get(offset)
+            .copied()
+            .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))
+    };
+    for offset in [5, 37] {
+        ensure!(
+            byte(offset)? & 0x40 == 0,
+            "non-colliding body (filter flag No Collision)"
+        );
+    }
+    for offset in [28, 48] {
+        let response = byte(offset)?;
+        ensure!(
+            !matches!(response, 2 | 3),
+            "non-colliding body (collision response {response})"
+        );
+    }
+    Ok(())
+}
+
+/// The scale a sphere's radius takes from `transform`. A sphere stays a sphere only under a
+/// uniform scale without shear, so any other transform is refused instead of writing a
+/// sphere of the wrong size.
+fn uniform_scale(transform: Mat4, shape: &str) -> Result<f32> {
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z].map(|axis| transform.transform_vector3(axis));
+    let scale = axes[0].length();
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid {shape} transform scale"
+    );
+    let tolerance = scale * 1.0e-3;
+    ensure!(
+        axes.iter()
+            .all(|axis| (axis.length() - scale).abs() <= tolerance)
+            && axes[0].dot(axes[1]).abs() <= tolerance * scale
+            && axes[0].dot(axes[2]).abs() <= tolerance * scale
+            && axes[1].dot(axes[2]).abs() <= tolerance * scale,
+        "{shape} under a non-uniform or sheared transform is unsupported"
+    );
+    Ok(scale)
+}
+
+/// A Havok radius in runtime units: x 70 and the transform scale, finite and above zero.
+fn runtime_radius(radius: f32, scale: f32) -> Result<f32> {
+    let radius = radius * HAVOK_TO_CREATION * scale;
+    ensure!(
+        radius.is_finite() && radius > 0.0,
+        "collision radius out of range"
+    );
+    Ok(radius)
+}
+
 fn point(transform: Mat4, p: Vec3) -> Result<[f32; 3]> {
     let p = transform.transform_point3(p);
     ensure!(p.is_finite(), "non-finite collision point");
@@ -681,6 +1080,193 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_strategies::{config, corrupted};
+    use proptest::prelude::*;
+
+    #[test]
+    fn classifies_bodies_by_motion_system_quality_and_mass() {
+        // Simulated systems (nif.xml hkMotionType) with a moving quality and mass.
+        for motion in [1, 2, 3, 4, 5, 8] {
+            for quality in [3, 4, 5, 6] {
+                assert_eq!(classify(motion, quality, 1.0), BodyKind::Dynamic);
+            }
+        }
+        // Vanilla's exporter default: box stabilized, invalid quality, mass 0.
+        assert_eq!(classify(5, 0, 0.0), BodyKind::Fixed);
+        assert_eq!(classify(5, 4, 0.0), BodyKind::Fixed);
+        assert_eq!(classify(5, 4, f32::NAN), BodyKind::Fixed);
+        assert_eq!(classify(5, 1, 3.0), BodyKind::Fixed);
+        assert_eq!(classify(7, 4, 3.0), BodyKind::Fixed); // MO_SYS_FIXED
+        assert_eq!(classify(9, 8, 3.0), BodyKind::Fixed); // MO_SYS_CHARACTER
+        assert_eq!(classify(6, 2, 0.0), BodyKind::Keyframed);
+        assert_eq!(classify(6, 2, 5.0), BodyKind::Fixed);
+    }
+
+    /// A `bhkRigidBody` block written offset by offset, independently of the dummy-content
+    /// writer, with a distinct value at every offset the reader uses.
+    fn hand_built_body() -> Vec<u8> {
+        let mut b = vec![0_u8; 250];
+        let put = |b: &mut Vec<u8>, at: usize, v: f32| {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        b[4] = 17; // collision layer
+        // Inertia rows at 116, 132, 148 (the fourth float of each row is unused padding).
+        for (i, at) in [116, 120, 124, 132, 136, 140, 148, 152, 156]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut b, at, 0.5 + i as f32);
+        }
+        for at in [128, 144, 160] {
+            put(&mut b, at, 99.0);
+        }
+        put(&mut b, 164, 0.25);
+        put(&mut b, 168, 0.5);
+        put(&mut b, 172, 0.75);
+        put(&mut b, 176, 99.0); // centre w
+        put(&mut b, 180, 3.5); // mass
+        put(&mut b, 184, 0.11); // linear damping
+        put(&mut b, 188, 0.22); // angular damping
+        put(&mut b, 192, 77.0); // time factor, unused
+        put(&mut b, 196, 78.0); // gravity factor, unused
+        put(&mut b, 200, 0.33); // friction
+        put(&mut b, 204, 79.0); // rolling friction, unused
+        put(&mut b, 208, 0.44); // restitution
+        put(&mut b, 212, 12.0); // max linear velocity
+        put(&mut b, 216, 5.5); // max angular velocity
+        put(&mut b, 220, 80.0); // penetration depth, unused
+        b[224] = 4; // motion system
+        b[225] = 2; // deactivator
+        b[226] = 9; // solver deactivation, unused
+        b[227] = 5; // quality
+        b
+    }
+
+    #[test]
+    fn hand_built_body_block_pins_every_offset() {
+        let shapes = [CollisionShape::Hull { points: Vec::new() }];
+        let body = read_dynamics(&hand_built_body(), Mat4::IDENTITY, &shapes).unwrap();
+        assert_eq!(
+            (
+                body.havok.motion_system,
+                body.havok.deactivator_type,
+                body.havok.quality_type,
+                body.havok.collision_layer
+            ),
+            (4, 2, 5, 17)
+        );
+        assert_eq!(body.kind, BodyKind::Dynamic);
+        assert_eq!(body.mass, 3.5);
+        assert_eq!((body.linear_damping, body.angular_damping), (0.11, 0.22));
+        assert_eq!((body.friction, body.restitution), (0.33, 0.44));
+        assert_eq!(body.max_linear_velocity, 12.0 * HAVOK_TO_CREATION);
+        assert_eq!(body.max_angular_velocity, 5.5);
+        assert!(body.convex);
+        // Havok centre (0.25, 0.5, 0.75) x 70 in Creation axes, then (x, z, -y) for runtime.
+        let near =
+            |a: f32, e: f32| assert!((a - e).abs() < 1.0e-3 * e.abs().max(1.0), "{a} != {e}");
+        for (a, e) in body.center_of_mass.into_iter().zip([17.5, 52.5, -35.0]) {
+            near(a, e);
+        }
+        // Havok rows (0.5 1.5 2.5 / 3.5 4.5 5.5 / 6.5 7.5 8.5) x 70^2, symmetrised (creation
+        // xy 2.5, xz 4.5, yz 6.5), then runtime (x, y, z) = (x, z, -y).
+        let scale = HAVOK_TO_CREATION * HAVOK_TO_CREATION;
+        let expected = [
+            0.5, 4.5, -2.5, //
+            4.5, 8.5, -6.5, //
+            -2.5, -6.5, 4.5,
+        ];
+        for (a, e) in body.inertia.into_iter().zip(expected) {
+            near(a, e * scale);
+        }
+    }
+
+    #[test]
+    fn overflow_after_unit_conversion_skips_the_body() {
+        let shapes = [CollisionShape::Hull { points: Vec::new() }];
+        for offset in [212, 164, 116] {
+            let mut bytes = hand_built_body();
+            bytes[offset..offset + 4].copy_from_slice(&f32::MAX.to_le_bytes());
+            assert!(
+                read_dynamics(&bytes, Mat4::IDENTITY, &shapes).is_err(),
+                "offset {offset}"
+            );
+        }
+    }
+
+    fn body_nif() -> Vec<u8> {
+        use dummy_content::nif::{BoxBody, StaticShape, static_shape_with_bodies};
+        let body = |name, transform| BoxBody {
+            node_name: name,
+            half_extents: [0.1, 0.2, 0.3],
+            transform,
+            collision_layer: 4,
+            collision_flags: 0,
+            collision_response: 1,
+            inner_collision_flags: 0,
+            inner_collision_response: 1,
+            shape: dummy_content::nif::BodyShape::Box,
+            motion_system: 4,
+            deactivator_type: 1,
+            quality_type: 4,
+            mass: 2.0,
+            inertia: [0.1, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.3],
+            center_of_mass: [0.0; 3],
+            linear_damping: 0.1,
+            angular_damping: 0.05,
+            friction: 0.5,
+            restitution: 0.4,
+            max_linear_velocity: 104.4,
+            max_angular_velocity: 31.57,
+        };
+        static_shape_with_bodies(
+            &StaticShape {
+                name: "Quad",
+                positions: &[[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+                normals: &[[0.0, 0.0, 1.0]; 3],
+                uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                indices: &[[0, 1, 2]],
+                diffuse: "textures/a.dds",
+                normal_texture: "textures/b.dds",
+            },
+            &[
+                body("A", None),
+                body("B", Some(([1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0]))),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn extract(bytes: &[u8]) -> Result<CollisionAsset> {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("body.nif");
+        fs::write(&input, bytes).unwrap();
+        crate::mesh::MeshConverter::extract_collision(&input)
+    }
+
+    #[test]
+    fn body_fixture_extracts_both_bodies() {
+        let asset = extract(&body_nif()).unwrap();
+        assert_eq!(asset.bodies.len(), 2, "{:?}", asset.skipped);
+    }
+
+    #[test]
+    fn truncated_body_nif_never_panics() {
+        let bytes = body_nif();
+        // The body blocks are the tail of the file, so every cut there lands inside one.
+        for len in (bytes.len().saturating_sub(700)..bytes.len()).step_by(3) {
+            let _ = extract(&bytes[..len]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(config(128))]
+
+        #[test]
+        fn corrupted_body_nif_never_panics(bytes in corrupted(body_nif())) {
+            let _ = extract(&bytes);
+        }
+    }
 
     #[test]
     fn ni_tri_strips_collision_uses_creation_units_and_shape_reference() {
@@ -794,6 +1380,284 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Decodes one shape block written by hand, with the given block kind.
+    fn decode_one(kind: &str, bytes: &[u8], transform: Mat4) -> Result<Vec<CollisionShape>> {
+        let blocks = [Block { kind, bytes }];
+        let mut shapes = Vec::new();
+        extract_shape(&blocks, 0, transform, &mut shapes, 0)?;
+        Ok(shapes)
+    }
+
+    fn near(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1.0e-3, "{actual} != {expected}");
+    }
+
+    fn sphere_at(shape: &CollisionShape) -> ([f32; 3], f32) {
+        let CollisionShape::Capsule { a, b, radius } = shape else {
+            panic!("expected a sphere-capsule, got {shape:?}");
+        };
+        assert_eq!(a, b, "a sphere is a zero-length capsule");
+        (*a, *radius)
+    }
+
+    #[test]
+    fn sphere_shape_decodes_to_a_zero_length_capsule_in_creation_units() {
+        let mut bytes = vec![0_u8; 8];
+        bytes[0..4].copy_from_slice(&7_u32.to_le_bytes()); // material, unused
+        bytes[4..8].copy_from_slice(&0.5_f32.to_le_bytes()); // radius, Havok units
+        let shapes = decode_one(
+            "bhkSphereShape",
+            &bytes,
+            Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)),
+        )
+        .unwrap();
+        let [shape] = shapes.as_slice() else {
+            panic!("expected one sphere");
+        };
+        let (center, radius) = sphere_at(shape);
+        // Creation (1, 2, 3), then the runtime basis (x, z, -y); 0.5 x 70 units.
+        assert_eq!(center, [1.0, 3.0, -2.0]);
+        assert_eq!(radius, 35.0);
+    }
+
+    #[test]
+    fn cylinder_shape_decodes_two_rings_of_sixteen_points() {
+        let mut bytes = vec![0_u8; 64];
+        // Axis from (1, 0, 0) to (3, 0, 0), radius 0.5, all Havok units.
+        let mut put =
+            |at: usize, value: f32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        put(16, 1.0);
+        put(32, 3.0);
+        put(48, 0.5);
+        let shapes = decode_one("bhkCylinderShape", &bytes, Mat4::IDENTITY).unwrap();
+        let [CollisionShape::Hull { points }] = shapes.as_slice() else {
+            panic!("expected one cylinder hull");
+        };
+        assert_eq!(points.len(), CYLINDER_RING_POINTS * 2);
+        for (index, point) in points.iter().enumerate() {
+            // Runtime x is Creation x, so each ring keeps its end's coordinate; the ring sits
+            // 0.5 x 70 units from the axis.
+            near(
+                point[0],
+                if index < CYLINDER_RING_POINTS {
+                    70.0
+                } else {
+                    210.0
+                },
+            );
+            near((point[1] * point[1] + point[2] * point[2]).sqrt(), 35.0);
+        }
+        // The basis is u = Y, v = X x Y = Z, so the first point of each end ring is on
+        // +Creation Y (runtime -z); quarter turns land on the runtime axes.
+        let quarter = CYLINDER_RING_POINTS / 4;
+        for (index, expected) in [
+            (0, [70.0, 0.0, -35.0]),
+            (quarter, [70.0, 35.0, 0.0]),
+            (2 * quarter, [70.0, 0.0, 35.0]),
+            (3 * quarter, [70.0, -35.0, 0.0]),
+            (CYLINDER_RING_POINTS, [210.0, 0.0, -35.0]),
+            (CYLINDER_RING_POINTS + quarter, [210.0, 35.0, 0.0]),
+        ] {
+            for axis in 0..3 {
+                near(points[index][axis], expected[axis]);
+            }
+        }
+        // Consecutive ring points are one 1/16 turn apart.
+        let (first, second) = (points[0], points[1]);
+        let chord = ((first[0] - second[0]).powi(2)
+            + (first[1] - second[1]).powi(2)
+            + (first[2] - second[2]).powi(2))
+        .sqrt();
+        near(chord, 2.0 * 35.0 * (std::f32::consts::TAU / 32.0).sin());
+    }
+
+    #[test]
+    fn multi_sphere_shape_decodes_one_capsule_per_bound() {
+        let mut bytes = vec![0_u8; 20 + 2 * 16];
+        bytes[16..20].copy_from_slice(&2_u32.to_le_bytes());
+        // Bound 0: centre (1, 0, 0), radius 0.25; bound 1: centre (0, 2, 0), radius 0.5.
+        for (index, (center, radius)) in [([1.0_f32, 0.0, 0.0], 0.25_f32), ([0.0, 2.0, 0.0], 0.5)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = 20 + index * 16;
+            for (axis, value) in center.into_iter().enumerate() {
+                let bytes = &mut bytes[at + axis * 4..at + 4 + axis * 4];
+                bytes.copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[at + 12..at + 16].copy_from_slice(&radius.to_le_bytes());
+        }
+        let shapes = decode_one("bhkMultiSphereShape", &bytes, Mat4::IDENTITY).unwrap();
+        let [first, second] = shapes.as_slice() else {
+            panic!("expected two sphere capsules");
+        };
+        let (first_center, first_radius) = sphere_at(first);
+        let (second_center, second_radius) = sphere_at(second);
+        // Creation (70, 0, 0) and (0, 140, 0) in the runtime basis (x, z, -y).
+        assert_eq!(first_center, [70.0, 0.0, 0.0]);
+        assert_eq!(first_radius, 17.5);
+        assert_eq!(second_center, [0.0, 0.0, -140.0]);
+        assert_eq!(second_radius, 35.0);
+    }
+
+    #[test]
+    fn short_or_degenerate_sphere_cylinder_and_multi_sphere_shapes_bail() {
+        // Empty blocks.
+        for kind in ["bhkSphereShape", "bhkCylinderShape", "bhkMultiSphereShape"] {
+            assert!(
+                decode_one(kind, &[], Mat4::IDENTITY).is_err(),
+                "{kind} accepted an empty block"
+            );
+        }
+        // A sphere with a zero radius.
+        let mut sphere = vec![0_u8; 8];
+        assert!(decode_one("bhkSphereShape", &sphere, Mat4::IDENTITY).is_err());
+        sphere[4..8].copy_from_slice(&1.0_f32.to_le_bytes());
+        assert!(decode_one("bhkSphereShape", &sphere, Mat4::IDENTITY).is_ok());
+        // A cylinder whose axis is a single point, or with a zero radius.
+        let mut cylinder = vec![0_u8; 64];
+        cylinder[16..20].copy_from_slice(&1.0_f32.to_le_bytes());
+        cylinder[32..36].copy_from_slice(&1.0_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.5_f32.to_le_bytes());
+        assert!(
+            decode_one("bhkCylinderShape", &cylinder, Mat4::IDENTITY).is_err(),
+            "degenerate cylinder axis was accepted"
+        );
+        cylinder[32..36].copy_from_slice(&2.0_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.0_f32.to_le_bytes());
+        assert!(
+            decode_one("bhkCylinderShape", &cylinder, Mat4::IDENTITY).is_err(),
+            "zero cylinder radius was accepted"
+        );
+        // A multi-sphere with no spheres, too many spheres, or a truncated bound list.
+        let multi = |count: u32| {
+            let mut bytes = vec![0_u8; 20 + count as usize * 16];
+            bytes[16..20].copy_from_slice(&count.to_le_bytes());
+            for index in 0..count as usize {
+                bytes[20 + index * 16 + 12..20 + index * 16 + 16]
+                    .copy_from_slice(&0.5_f32.to_le_bytes());
+            }
+            bytes
+        };
+        for count in [0, 9] {
+            assert!(
+                decode_one("bhkMultiSphereShape", &multi(count), Mat4::IDENTITY).is_err(),
+                "multi-sphere count {count} was accepted"
+            );
+        }
+        assert!(
+            decode_one("bhkMultiSphereShape", &multi(2)[..28], Mat4::IDENTITY).is_err(),
+            "truncated multi-sphere data was accepted"
+        );
+    }
+
+    #[test]
+    fn bodies_flagged_no_collision_or_without_contact_response_are_rejected() {
+        let mut bytes = vec![0_u8; 52];
+        bytes[4] = 4; // layer CLUTTER
+        bytes[28] = 1; // RESPONSE_SIMPLE_CONTACT
+        bytes[48] = 1;
+        assert!(ensure_body_collides(&bytes).is_ok());
+        bytes[5] = 0x20; // MOPP Scaled only
+        assert!(ensure_body_collides(&bytes).is_ok());
+        bytes[5] = 0x40; // No Collision
+        assert!(ensure_body_collides(&bytes).is_err());
+        bytes[5] = 0;
+        bytes[37] = 0x40; // the copy in bhkRigidBodyCInfo2010
+        assert!(ensure_body_collides(&bytes).is_err());
+        bytes[37] = 0;
+        for offset in [28, 48] {
+            for response in [2, 3] {
+                bytes[offset] = response;
+                assert!(
+                    ensure_body_collides(&bytes).is_err(),
+                    "response {response} @{offset} was accepted"
+                );
+            }
+            bytes[offset] = 1;
+        }
+        assert!(ensure_body_collides(&bytes).is_ok());
+        assert!(ensure_body_collides(&bytes[..40]).is_err());
+    }
+
+    #[test]
+    fn sphere_and_cylinder_radii_follow_the_transform_scale() {
+        let scaled = Mat4::from_scale(Vec3::splat(2.0));
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
+        let shapes = decode_one("bhkSphereShape", &sphere, scaled).unwrap();
+        let (_, radius) = sphere_at(&shapes[0]);
+        assert_eq!(radius, 70.0);
+        let mut cylinder = vec![0_u8; 64];
+        cylinder[16..20].copy_from_slice(&1.0_f32.to_le_bytes());
+        cylinder[32..36].copy_from_slice(&3.0_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.5_f32.to_le_bytes());
+        let shapes = decode_one("bhkCylinderShape", &cylinder, scaled).unwrap();
+        let [CollisionShape::Hull { points }] = shapes.as_slice() else {
+            panic!("expected one cylinder hull");
+        };
+        for (index, point) in points.iter().enumerate() {
+            near(
+                point[0],
+                if index < CYLINDER_RING_POINTS {
+                    140.0
+                } else {
+                    420.0
+                },
+            );
+            near((point[1] * point[1] + point[2] * point[2]).sqrt(), 70.0);
+        }
+    }
+
+    #[test]
+    fn spheres_under_a_non_uniform_or_sheared_transform_are_refused() {
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
+        let mut multi = vec![0_u8; 36];
+        multi[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        multi[32..36].copy_from_slice(&0.5_f32.to_le_bytes());
+        let stretched = Mat4::from_scale(Vec3::new(1.0, 2.0, 1.0));
+        let sheared = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let rotated = Mat4::from_scale_rotation_translation(
+            Vec3::splat(2.0),
+            Quat::from_rotation_z(0.7),
+            Vec3::ONE,
+        );
+        for (kind, bytes) in [("bhkSphereShape", &sphere), ("bhkMultiSphereShape", &multi)] {
+            for transform in [stretched, sheared] {
+                let error = decode_one(kind, bytes, transform).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("non-uniform"),
+                    "{kind}: {error:#}"
+                );
+            }
+            let shapes = decode_one(kind, bytes, rotated).unwrap();
+            near(sphere_at(&shapes[0]).1, 70.0);
+        }
+    }
+
+    #[test]
+    fn radii_and_axes_that_overflow_after_conversion_are_rejected() {
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&f32::MAX.to_le_bytes());
+        assert!(decode_one("bhkSphereShape", &sphere, Mat4::IDENTITY).is_err());
+        let mut multi = vec![0_u8; 36];
+        multi[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        multi[32..36].copy_from_slice(&f32::MAX.to_le_bytes());
+        assert!(decode_one("bhkMultiSphereShape", &multi, Mat4::IDENTITY).is_err());
+        let mut capsule = vec![0_u8; 48];
+        capsule[28..32].copy_from_slice(&f32::MAX.to_le_bytes());
+        capsule[32..36].copy_from_slice(&1.0_f32.to_le_bytes());
+        assert!(decode_one("bhkCapsuleShape", &capsule, Mat4::IDENTITY).is_err());
+        // Finite end points whose distance overflows: the axis length is infinite.
+        let mut cylinder = vec![0_u8; 64];
+        cylinder[32..36].copy_from_slice(&1.0e20_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.5_f32.to_le_bytes());
+        assert!(decode_one("bhkCylinderShape", &cylinder, Mat4::IDENTITY).is_err());
     }
 
     #[test]

@@ -38,22 +38,119 @@ pub struct StaticShape<'a> {
     pub normal_texture: &'a str,
 }
 
+/// A Havok box rigid body attached to its own `NiNode` under the root, written as a
+/// `bhkCollisionObject` -> `bhkRigidBody` (or `bhkRigidBodyT`) -> `bhkBoxShape` chain.
+/// Every value is stored raw, in Havok units (a Creation unit is 1/70 of one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxBody<'a> {
+    /// Name of the `NiNode` the collision object targets.
+    pub node_name: &'a str,
+    /// Box half extents (`bhkBoxShape` dimensions).
+    pub half_extents: [f32; 3],
+    /// `Some((translation, rotation xyzw))` writes a `bhkRigidBodyT`, else a `bhkRigidBody`.
+    pub transform: Option<([f32; 3], [f32; 4])>,
+    pub collision_layer: u8,
+    /// `CollisionFilterFlags` and `hkResponseType` of the `bhkWorldObject`/`bhkEntityCInfo` copy.
+    pub collision_flags: u8,
+    pub collision_response: u8,
+    /// The same two values in the `bhkRigidBodyCInfo2010` copy.
+    pub inner_collision_flags: u8,
+    pub inner_collision_response: u8,
+    /// The body's shape: a box with `half_extents`, or a sphere or cylinder.
+    pub shape: BodyShape,
+    /// Raw `hkMotionType`, `hkDeactivatorType` and `hkQualityType` values (nif.xml).
+    pub motion_system: u8,
+    pub deactivator_type: u8,
+    pub quality_type: u8,
+    pub mass: f32,
+    /// Row-major inertia tensor.
+    pub inertia: [f32; 9],
+    pub center_of_mass: [f32; 3],
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub max_linear_velocity: f32,
+    pub max_angular_velocity: f32,
+}
+
+/// Shape block written for a [`BoxBody`] (Havok units).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BodyShape {
+    /// `bhkBoxShape` with the body's `half_extents`.
+    Box,
+    /// `bhkSphereShape`.
+    Sphere { radius: f32 },
+    /// `bhkMultiSphereShape`: the first `count` of `spheres` (centre, radius).
+    MultiSphere {
+        count: u32,
+        spheres: [([f32; 3], f32); 8],
+    },
+    /// `bhkCylinderShape` from `a` to `b`.
+    Cylinder {
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+    },
+}
+
 /// Generates a minimal static NIF containing one triangle mesh.
 pub fn static_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
+    static_shape_with_bodies(shape, &[])
+}
+
+/// Like [`static_shape`], plus one collision body per entry. Each body hangs off its own
+/// `NiNode` child of the root, so the converter's glTF node order is root, shape, then the
+/// body nodes in order.
+pub fn static_shape_with_bodies(
+    shape: &StaticShape<'_>,
+    bodies: &[BoxBody<'_>],
+) -> Result<Vec<u8>> {
     validate(shape)?;
-    let strings = [shape.name];
-    let blocks = [
-        fade_node(),
+    for body in bodies {
+        validate_body(body)?;
+    }
+    let mut strings = vec![shape.name];
+    strings.extend(bodies.iter().map(|body| body.node_name));
+    let first_body_block = 4_u32;
+    let mut children = vec![1_u32];
+    children.extend((0..bodies.len()).map(|i| first_body_block + 4 * i as u32));
+    let mut blocks = vec![
+        fade_node(&children),
         triangle_shape(shape)?,
         lighting_shader_property(),
         texture_set(shape)?,
     ];
-    let block_types = [
+    let mut block_types = vec![
         "BSFadeNode",
         "BSTriShape",
         "BSLightingShaderProperty",
         "BSShaderTextureSet",
     ];
+    for (index, body) in bodies.iter().enumerate() {
+        let node_block = first_body_block + 4 * index as u32;
+        let mut node = Vec::new();
+        push_av_object_with(&mut node, 1 + index as u32, node_block + 1);
+        push_u32(&mut node, 0); // children
+        push_u32(&mut node, 0); // effects
+        blocks.push(node);
+        block_types.push("NiNode");
+        let mut object = Vec::new();
+        push_u32(&mut object, node_block); // target
+        push_u16(&mut object, 1); // flags
+        push_u32(&mut object, node_block + 2); // body
+        blocks.push(object);
+        block_types.push("bhkCollisionObject");
+        blocks.push(rigid_body(body, node_block + 3));
+        block_types.push(if body.transform.is_some() {
+            "bhkRigidBodyT"
+        } else {
+            "bhkRigidBody"
+        });
+        let (shape, kind) = body_shape(body);
+        blocks.push(shape);
+        block_types.push(kind);
+    }
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"Gamebryo File Format, Version 20.2.0.7\n");
@@ -175,13 +272,155 @@ fn validate(shape: &StaticShape<'_>) -> Result<()> {
     Ok(())
 }
 
-fn fade_node() -> Vec<u8> {
+fn fade_node(children: &[u32]) -> Vec<u8> {
     let mut block = Vec::with_capacity(84);
     push_av_object(&mut block, NULL_REF);
-    push_u32(&mut block, 1);
-    push_u32(&mut block, 1);
+    push_u32(&mut block, children.len() as u32);
+    for child in children {
+        push_u32(&mut block, *child);
+    }
     push_u32(&mut block, 0);
     block
+}
+
+fn validate_body(body: &BoxBody<'_>) -> Result<()> {
+    ensure!(
+        !body.node_name.is_empty()
+            && body
+                .node_name
+                .bytes()
+                .all(|byte| (0x20..0x7f).contains(&byte)),
+        "NIF body node name must be printable ASCII"
+    );
+    ensure!(
+        body.shape != BodyShape::Box || body.half_extents.iter().all(|v| v.is_finite() && *v > 0.0),
+        "NIF box body needs positive half extents"
+    );
+    let finite = body
+        .inertia
+        .iter()
+        .chain(&body.center_of_mass)
+        .all(|v| v.is_finite())
+        && [
+            body.mass,
+            body.linear_damping,
+            body.angular_damping,
+            body.friction,
+            body.restitution,
+            body.max_linear_velocity,
+            body.max_angular_velocity,
+        ]
+        .iter()
+        .all(|v| v.is_finite());
+    ensure!(finite, "NIF body contains a non-finite value");
+    Ok(())
+}
+
+/// `bhkRigidBody` block: `bhkWorldObject`, `bhkEntityCInfo`, then `bhkRigidBodyCInfo2010`
+/// (nif.xml, Skyrim), then constraints and body flags.
+fn rigid_body(body: &BoxBody<'_>, shape: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(250);
+    push_u32(&mut b, shape);
+    b.extend_from_slice(&[body.collision_layer, body.collision_flags, 0, 0]); // havok filter
+    b.extend_from_slice(&[0; 20]); // world object info
+    b.extend_from_slice(&[body.collision_response, 0, 0xff, 0xff]); // entity info
+    b.extend_from_slice(&[0; 4]); // unused
+    b.extend_from_slice(&[body.collision_layer, body.inner_collision_flags, 0, 0]); // havok filter
+    b.extend_from_slice(&[0; 4]); // unused
+    push_u32(&mut b, 0); // unknown int
+    b.extend_from_slice(&[body.inner_collision_response, 0, 0xff, 0xff]); // response, unused, callback delay
+    let (translation, rotation) = body.transform.unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+    for value in translation.into_iter().chain([0.0]) {
+        push_f32(&mut b, value);
+    }
+    for value in rotation {
+        push_f32(&mut b, value);
+    }
+    b.extend_from_slice(&[0; 32]); // linear and angular velocity
+    for row in body.inertia.chunks(3) {
+        for value in row.iter().copied().chain([0.0]) {
+            push_f32(&mut b, value);
+        }
+    }
+    for value in body.center_of_mass.into_iter().chain([0.0]) {
+        push_f32(&mut b, value);
+    }
+    for value in [
+        body.mass,
+        body.linear_damping,
+        body.angular_damping,
+        1.0, // time factor
+        1.0, // gravity factor
+        body.friction,
+        0.0, // rolling friction multiplier
+        body.restitution,
+        body.max_linear_velocity,
+        body.max_angular_velocity,
+        0.15, // penetration depth
+    ] {
+        push_f32(&mut b, value);
+    }
+    b.extend_from_slice(&[
+        body.motion_system,
+        body.deactivator_type,
+        1, // solver deactivation off
+        body.quality_type,
+        0, // auto remove level
+        0, // response modifier flags
+        3, // shape keys in contact point
+        0, // force collided onto PPU
+    ]);
+    b.extend_from_slice(&[0; 12]);
+    push_u32(&mut b, 0); // constraints
+    push_u16(&mut b, 0); // body flags
+    b
+}
+
+/// The body's shape block and its block type (nif.xml: material, convex radius, then fields).
+fn body_shape(body: &BoxBody<'_>) -> (Vec<u8>, &'static str) {
+    let mut b = Vec::with_capacity(64);
+    push_u32(&mut b, 0); // material
+    match body.shape {
+        BodyShape::Box => {
+            push_f32(&mut b, 0.0); // radius
+            b.extend_from_slice(&[0; 8]);
+            for value in body.half_extents {
+                push_f32(&mut b, value);
+            }
+            push_f32(&mut b, 0.0);
+            (b, "bhkBoxShape")
+        }
+        BodyShape::Sphere { radius } => {
+            push_f32(&mut b, radius);
+            (b, "bhkSphereShape")
+        }
+        BodyShape::MultiSphere { count, spheres } => {
+            assert!(
+                count as usize <= spheres.len(),
+                "a fixture holds at most 8 spheres"
+            );
+            b.extend_from_slice(&[0; 12]); // shape property
+            push_u32(&mut b, count);
+            for (center, radius) in spheres.iter().take(count as usize) {
+                for value in center.iter().copied().chain([*radius]) {
+                    push_f32(&mut b, value);
+                }
+            }
+            (b, "bhkMultiSphereShape")
+        }
+        BodyShape::Cylinder { a, b: end, radius } => {
+            push_f32(&mut b, 0.0); // convex radius
+            b.extend_from_slice(&[0; 8]);
+            for point in [a, end] {
+                for value in point.into_iter().chain([0.0]) {
+                    push_f32(&mut b, value);
+                }
+            }
+            push_f32(&mut b, radius);
+            b.extend_from_slice(&[0; 12]);
+            (b, "bhkCylinderShape")
+        }
+    }
 }
 
 fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
@@ -308,6 +547,10 @@ fn texture_set(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
 }
 
 fn push_av_object(out: &mut Vec<u8>, name: u32) {
+    push_av_object_with(out, name, NULL_REF);
+}
+
+fn push_av_object_with(out: &mut Vec<u8>, name: u32, collision_object: u32) {
     push_u32(out, name);
     push_u32(out, NULL_REF);
     push_u32(out, NULL_REF);
@@ -319,7 +562,7 @@ fn push_av_object(out: &mut Vec<u8>, name: u32) {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&1.0f32.to_le_bytes());
-    push_u32(out, NULL_REF);
+    push_u32(out, collision_object);
 }
 
 fn push_f32(out: &mut Vec<u8>, value: f32) {

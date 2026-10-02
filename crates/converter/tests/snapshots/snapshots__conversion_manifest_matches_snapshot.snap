@@ -67,7 +67,7 @@ expression: manifest
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
       "output_hash": "[output_hash]",
-      "output_size": 1868,
+      "output_size": 1880,
       "source_hash": "[source_hash]"
     },
     "scripts/generated.pex": {
