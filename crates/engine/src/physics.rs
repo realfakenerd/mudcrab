@@ -2,6 +2,7 @@
 //! All units are Creation units.
 
 use bevy::{
+    ecs::system::{SystemId, SystemParam},
     input::mouse::MouseMotion,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
@@ -15,6 +16,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 
 use crate::{
+    console::{AppConsoleExt, ConsoleCommand, ConsoleState, console_closed},
     profiling::ProfilingState,
     streaming::{StreamingMetrics, TerrainCollider},
     world::components::StreamingCamera,
@@ -313,6 +315,7 @@ pub struct PlayerControlsPlugin;
 
 impl Plugin for PlayerControlsPlugin {
     fn build(&self, app: &mut App) {
+        register_move_mode_effect(app.world_mut());
         app.add_plugins(PhysicsCorePlugin)
             .init_resource::<MoveMode>()
             .init_resource::<WalkIntent>()
@@ -320,6 +323,7 @@ impl Plugin for PlayerControlsPlugin {
             .init_resource::<LookIntent>()
             .init_resource::<WalkEntryStatus>()
             .init_resource::<CursorCapture>()
+            .add_console_command(toggle_collision_command())
             .add_systems(
                 Update,
                 (
@@ -327,7 +331,7 @@ impl Plugin for PlayerControlsPlugin {
                     look_input_system,
                     noclip_flight_system,
                     walk_intent_system,
-                    toggle_mode_system,
+                    toggle_mode_system.run_if(console_closed),
                     walk_camera_follow_system,
                     sprint_fov_system,
                     overlay_system,
@@ -352,17 +356,25 @@ impl Plugin for WorldPlayerPlugin {
                 .disabled(),
             )
             .init_resource::<HeldTankard>()
+            .add_console_command(toggle_collision_geometry_command())
             .add_systems(PostStartup, setup_world_player)
             .add_systems(
                 Update,
                 (
-                    toggle_collision_debug_system,
+                    toggle_collision_debug_system.run_if(console_closed),
                     update_collision_debug_visibility,
                 )
                     .chain()
                     .before(overlay_system),
             )
-            .add_systems(Update, (world_tankard_input, move_held_tankard).chain());
+            .add_systems(
+                Update,
+                (
+                    world_tankard_input.run_if(console_closed),
+                    move_held_tankard,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -910,6 +922,25 @@ pub fn try_enter_walk(
     Err("no free capsule placement nearby".to_owned())
 }
 
+/// Everything `clear_motion_state` touches, optional so the console works in partial apps.
+#[derive(SystemParam)]
+pub(crate) struct MotionReset<'w, 's> {
+    intent: Option<ResMut<'w, WalkIntent>>,
+    sprint: Option<ResMut<'w, SprintLatch>>,
+    states: Query<'w, 's, &'static mut WalkState>,
+    controllers: Query<'w, 's, &'static mut KinematicCharacterController>,
+}
+
+impl MotionReset<'_, '_> {
+    pub(crate) fn clear(&mut self) {
+        if let (Some(intent), Some(sprint)) =
+            (self.intent.as_deref_mut(), self.sprint.as_deref_mut())
+        {
+            clear_motion_state(intent, sprint, &mut self.states, &mut self.controllers);
+        }
+    }
+}
+
 /// Clear stale velocities + jump state on every toggle (V14).
 fn clear_motion_state(
     intent: &mut WalkIntent,
@@ -1086,6 +1117,11 @@ pub(crate) mod headless {
     use bevy::time::TimeUpdateStrategy;
 
     pub(crate) fn fixture_app() -> App {
+        fixture_app_with(|_| {})
+    }
+
+    /// The fixture app, with `extra` run on it before plugins finish (to add more plugins).
+    pub(crate) fn fixture_app_with(extra: impl FnOnce(&mut App)) -> App {
         let mut app = App::new();
         app.add_plugins((
             MinimalPlugins,
@@ -1098,6 +1134,7 @@ pub(crate) mod headless {
         app.init_resource::<ProfilingState>()
             .init_resource::<StreamingMetrics>();
         app.add_plugins(PhysicsFixturePlugin);
+        extra(&mut app);
         app.insert_resource(TimeUpdateStrategy::ManualDuration(
             std::time::Duration::from_secs_f32(PHYSICS_TIMESTEP),
         ));
@@ -1540,8 +1577,13 @@ fn toggle_collision_debug_system(
     mut debug: ResMut<DebugRenderContext>,
 ) {
     if keyboard.just_pressed(KeyCode::F3) {
-        debug.enabled = !debug.enabled;
+        flip_collision_debug(&mut debug);
     }
+}
+
+/// Flip the rapier collider outlines; shared by the F3 key and the `tcg` command.
+fn flip_collision_debug(debug: &mut DebugRenderContext) {
+    debug.enabled = !debug.enabled;
 }
 
 /// Keep a collider when any part of its world-space AABB reaches the camera's
@@ -1645,6 +1687,7 @@ fn setup_controlled_player(
     ));
 }
 
+/// T spawns a test tankard and E grabs or drops one, only while the cursor is captured.
 /// Riverwood test objects stay in world coordinates and are never children of a streamed cell.
 #[allow(clippy::too_many_arguments)]
 fn world_tankard_input(
@@ -1750,16 +1793,24 @@ fn cursor_lifecycle_system(
     mut sprint: ResMut<SprintLatch>,
     mut states: Query<&mut WalkState>,
     mut controllers: Query<&mut KinematicCharacterController>,
+    console: Option<Res<ConsoleState>>,
 ) {
-    // Focus loss or Escape releases; click recaptures (V6).
+    // Focus loss or Escape releases; click recaptures (V6). While the console is open, and on the
+    // frame it closes, it owns the capture state, so none of that applies; the cursor options
+    // below still follow it.
     let focused = windows.iter().all(|window| window.focused);
-    if !focused || keyboard.just_pressed(KeyCode::Escape) {
-        if *capture == CursorCapture::Captured {
-            *capture = CursorCapture::Released;
-            clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+    let console_owns_capture = console.is_some_and(|console| console.open || console.closing);
+    if !console_owns_capture {
+        if !focused || keyboard.just_pressed(KeyCode::Escape) {
+            if *capture == CursorCapture::Captured {
+                *capture = CursorCapture::Released;
+                clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+            }
+        } else if mouse_buttons.just_pressed(MouseButton::Left)
+            && *capture == CursorCapture::Released
+        {
+            *capture = CursorCapture::Captured;
         }
-    } else if mouse_buttons.just_pressed(MouseButton::Left) && *capture == CursorCapture::Released {
-        *capture = CursorCapture::Captured;
     }
     let (grab_mode, visible) = match *capture {
         CursorCapture::Captured => (CursorGrabMode::Locked, false),
@@ -1859,10 +1910,30 @@ fn walk_intent_system(
     intent.jump_pressed |= keyboard.just_pressed(KeyCode::Space);
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// One-shot id of the NOCLIP/WALK switch, shared by the V key and the `tcl` command.
+#[derive(Resource, Clone, Copy)]
+struct MoveModeEffect(SystemId);
+
+fn register_move_mode_effect(world: &mut World) {
+    let id = world.register_system(toggle_move_mode_effect);
+    world.insert_resource(MoveModeEffect(id));
+}
+
+/// V, only while the cursor is captured.
 fn toggle_mode_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     capture: Res<CursorCapture>,
+    effect: Res<MoveModeEffect>,
+    mut commands: Commands,
+) {
+    if keyboard.just_pressed(KeyCode::KeyV) && *capture == CursorCapture::Captured {
+        commands.run_system(effect.0);
+    }
+}
+
+/// Switch between NOCLIP and WALK, entering WALK only at a collision-free spot.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn toggle_move_mode_effect(
     tuning: Res<MovementTuning>,
     context: ReadRapierContext,
     mut mode: ResMut<MoveMode>,
@@ -1879,9 +1950,6 @@ fn toggle_mode_system(
     mut controllers: Query<&mut KinematicCharacterController>,
     mut commands: Commands,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyV) || *capture != CursorCapture::Captured {
-        return;
-    }
     match *mode {
         MoveMode::Noclip => {
             let (Ok(camera), Ok((entity, mut body, collider)), Ok(context)) =
@@ -1914,6 +1982,76 @@ fn toggle_mode_system(
         }
     }
     clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+}
+
+// ---------------------------------------------------------------------------
+// Console commands for the debug keys, under Skyrim's names. Each runs the same
+// effect as its key. The `T` (tankard) and `E` (grab) keys have no console
+// command: Skyrim has neither.
+// ---------------------------------------------------------------------------
+
+fn no_args(args: &[&str], usage: &str) -> Result<(), String> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("usage: {usage}"))
+    }
+}
+
+/// Skyrim's `ToggleCollision` / `tcl`; the `V` key runs the same effect.
+fn toggle_collision_command() -> ConsoleCommand {
+    ConsoleCommand {
+        name: "ToggleCollision",
+        short: Some("tcl"),
+        usage: "ToggleCollision",
+        help: "toggle noclip flight and walking (key V)",
+        handler: Box::new(|world, args| {
+            no_args(args, "ToggleCollision")?;
+            if !world.contains_resource::<MoveMode>() {
+                return Err("noclip is not available in this run".to_owned());
+            }
+            let before = *world.resource::<MoveMode>();
+            let Some(effect) = world.get_resource::<MoveModeEffect>().map(|e| e.0) else {
+                return Err("noclip is not available in this run".to_owned());
+            };
+            world.run_system(effect).map_err(|e| e.to_string())?;
+            let after = *world.resource::<MoveMode>();
+            if after == before {
+                let reason = world
+                    .get_resource::<WalkEntryStatus>()
+                    .and_then(|status| status.blocked_reason.clone());
+                return Err(match reason {
+                    Some(reason) => format!("cannot walk here: {reason}"),
+                    None => "no player to move in this run".to_owned(),
+                });
+            }
+            Ok(match after {
+                MoveMode::Noclip => "noclip ON".to_owned(),
+                MoveMode::Walk => "noclip OFF (walking)".to_owned(),
+            })
+        }),
+    }
+}
+
+/// Skyrim's `ToggleCollisionGeometry` / `tcg`; the `F3` key runs the same effect.
+fn toggle_collision_geometry_command() -> ConsoleCommand {
+    ConsoleCommand {
+        name: "ToggleCollisionGeometry",
+        short: Some("tcg"),
+        usage: "ToggleCollisionGeometry",
+        help: "toggle the collision outlines (key F3)",
+        handler: Box::new(|world, args| {
+            no_args(args, "ToggleCollisionGeometry")?;
+            let Some(mut debug) = world.get_resource_mut::<DebugRenderContext>() else {
+                return Err("collision outlines are not available in this run".to_owned());
+            };
+            flip_collision_debug(&mut debug);
+            Ok(format!(
+                "collision outlines {}",
+                if debug.enabled { "ON" } else { "OFF" }
+            ))
+        }),
+    }
 }
 
 fn overlay_system(
@@ -2645,5 +2783,288 @@ mod gate_tests {
                 "rebase injected tankard velocity: {before:?} -> {after:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::headless;
+    use super::*;
+    use crate::console::{ConsolePlugin, execute_line};
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn console_fixture() -> App {
+        let mut app = headless::fixture_app_with(|app| {
+            // `ToggleCollision`/`tcl` comes in with `PlayerControlsPlugin` through the fixture.
+            app.add_plugins(ConsolePlugin)
+                .add_console_command(toggle_collision_geometry_command())
+                .insert_resource(DebugRenderContext::default())
+                .add_systems(Update, toggle_collision_debug_system.run_if(console_closed));
+        });
+        app.update();
+        app
+    }
+
+    fn scrollback(app: &App) -> String {
+        app.world().resource::<ConsoleState>().scrollback.join("\n")
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+    }
+
+    /// Send a key press the way winit does; `InputPlugin` turns it into `ButtonInput` on update.
+    fn send_key(app: &mut App, key_code: KeyCode) {
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code,
+                logical_key: bevy::input::keyboard::Key::Character("x".into()),
+                state: bevy::input::ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+    }
+
+    fn mode(app: &App) -> MoveMode {
+        *app.world().resource::<MoveMode>()
+    }
+
+    #[test]
+    fn help_lists_every_physics_command() {
+        let mut app = console_fixture();
+        execute_line(app.world_mut(), "Help");
+        let text = scrollback(&app);
+        for line in [
+            "Help [text] - ",
+            "ClearConsole - ",
+            "ToggleCollision [tcl] - toggle noclip flight and walking (key V)",
+            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (key F3)",
+        ] {
+            assert!(text.contains(line), "Help is missing {line}: {text}");
+        }
+        // The filter finds a command by its short form and by its description.
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "help TCG");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ToggleCollision [tcl]"), "{text}");
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "help outlines");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ToggleCollision [tcl]"), "{text}");
+    }
+
+    #[test]
+    fn tcl_twice_flips_and_flips_back() {
+        let mut app = console_fixture();
+        assert_eq!(mode(&app), MoveMode::Noclip);
+        execute_line(app.world_mut(), "tcl");
+        assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
+        execute_line(app.world_mut(), "TCL");
+        assert_eq!(mode(&app), MoveMode::Noclip);
+        execute_line(app.world_mut(), "togglecollision");
+        assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
+    #[test]
+    fn key_and_command_agree_on_move_mode() {
+        let mut keyed = console_fixture();
+        keyed.insert_resource(CursorCapture::Captured);
+        press(&mut keyed, KeyCode::KeyV);
+        keyed
+            .world_mut()
+            .run_system_once(toggle_mode_system)
+            .unwrap();
+        let mut commanded = console_fixture();
+        // The removed `v` alias is unknown; `tcl` runs the key's effect.
+        execute_line(commanded.world_mut(), "v");
+        assert!(scrollback(&commanded).contains("unknown command \"v\""));
+        assert_eq!(mode(&commanded), MoveMode::Noclip);
+        execute_line(commanded.world_mut(), "tcl");
+        assert_eq!(mode(&keyed), MoveMode::Walk);
+        assert_eq!(mode(&keyed), mode(&commanded));
+        execute_line(commanded.world_mut(), "ToggleCollision");
+        assert_eq!(mode(&commanded), MoveMode::Noclip);
+    }
+
+    #[test]
+    fn key_and_command_agree_on_collision_outlines() {
+        let mut keyed = console_fixture();
+        let before = keyed.world().resource::<DebugRenderContext>().enabled;
+        press(&mut keyed, KeyCode::F3);
+        keyed
+            .world_mut()
+            .run_system_once(toggle_collision_debug_system)
+            .unwrap();
+        let mut commanded = console_fixture();
+        // The removed `f3` alias is unknown; Skyrim's `tcg` runs the key's effect.
+        execute_line(commanded.world_mut(), "f3");
+        assert!(scrollback(&commanded).contains("unknown command \"f3\""));
+        assert_eq!(
+            commanded.world().resource::<DebugRenderContext>().enabled,
+            before
+        );
+        execute_line(commanded.world_mut(), "tcg");
+        let key_state = keyed.world().resource::<DebugRenderContext>().enabled;
+        assert_ne!(key_state, before);
+        assert_eq!(
+            key_state,
+            commanded.world().resource::<DebugRenderContext>().enabled
+        );
+        execute_line(commanded.world_mut(), "ToggleCollisionGeometry");
+        assert_eq!(
+            commanded.world().resource::<DebugRenderContext>().enabled,
+            before
+        );
+    }
+
+    #[test]
+    fn tankard_and_grab_have_no_console_command() {
+        let mut app = console_fixture();
+        for line in ["tankard", "grab", "t", "e"] {
+            execute_line(app.world_mut(), line);
+        }
+        let text = scrollback(&app);
+        for line in ["tankard", "grab", "e"] {
+            assert!(
+                text.contains(&format!("unknown command \"{line}\"")),
+                "unknown missing for {line}: {text}"
+            );
+            assert!(
+                !text.contains(&format!("unknown command \"{line}\", did you mean")),
+                "unexpected suggestion for {line}: {text}"
+            );
+        }
+        assert!(
+            text.contains("unknown command \"t\", did you mean \"tc"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn open_console_blocks_the_debug_keys_look_and_recapture() {
+        let mut app = console_fixture();
+        // Open the console the way a player does, from a captured cursor.
+        app.insert_resource(CursorCapture::Captured);
+        send_key(&mut app, KeyCode::Backquote);
+        app.update();
+        assert!(app.world().resource::<ConsoleState>().open);
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        let camera_before = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<&Transform, With<ControlledCamera>>();
+            *query.single(app.world()).unwrap()
+        };
+        // V, a movement key, a click and a mouse move while open.
+        send_key(&mut app, KeyCode::KeyV);
+        send_key(&mut app, KeyCode::KeyW);
+        app.world_mut()
+            .write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Pressed,
+                window: Entity::PLACEHOLDER,
+            });
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(40.0, 10.0),
+        });
+        app.update();
+        assert_eq!(mode(&app), MoveMode::Noclip);
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(app.world().resource::<LookIntent>().yaw, 0.0);
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Transform, With<ControlledCamera>>();
+        assert_eq!(
+            query.single(app.world()).unwrap().translation,
+            camera_before.translation
+        );
+        // F3 is inert too.
+        let before = app.world().resource::<DebugRenderContext>().enabled;
+        send_key(&mut app, KeyCode::F3);
+        app.update();
+        assert_eq!(app.world().resource::<DebugRenderContext>().enabled, before);
+    }
+
+    #[test]
+    fn keys_still_work_through_the_schedule_with_the_console_closed() {
+        let mut app = console_fixture();
+        // The real schedule reads the capture state, so the cursor must be captured.
+        app.insert_resource(CursorCapture::Captured);
+        let before = app.world().resource::<DebugRenderContext>().enabled;
+        send_key(&mut app, KeyCode::KeyV);
+        send_key(&mut app, KeyCode::F3);
+        app.update();
+        assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
+        assert_ne!(app.world().resource::<DebugRenderContext>().enabled, before);
+    }
+
+    fn send_state(app: &mut App, key_code: KeyCode, state: bevy::input::ButtonState) {
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code,
+                logical_key: bevy::input::keyboard::Key::Character("x".into()),
+                state,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        app.update();
+    }
+
+    #[test]
+    fn keys_in_the_closing_frame_do_not_reach_the_game() {
+        use bevy::input::ButtonState::{Pressed, Released};
+        let mut app = console_fixture();
+        app.insert_resource(CursorCapture::Captured);
+        send_state(&mut app, KeyCode::Backquote, Pressed);
+        send_state(&mut app, KeyCode::Backquote, Released);
+        assert!(app.world().resource::<ConsoleState>().open);
+        // V and the closing backtick land in the same update.
+        send_key(&mut app, KeyCode::KeyV);
+        send_key(&mut app, KeyCode::Backquote);
+        app.update();
+        assert!(!app.world().resource::<ConsoleState>().open);
+        // The capture that movement and look read stays released for the closing frame, so they
+        // ignore that frame's keys and mouse motion (this checks the gate, not a moving body).
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(mode(&app), MoveMode::Noclip, "{}", scrollback(&app));
+        // One update later the capture is back and V works again.
+        send_state(&mut app, KeyCode::KeyV, Released);
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Captured
+        );
+        send_state(&mut app, KeyCode::Backquote, Released);
+        send_state(&mut app, KeyCode::KeyV, Pressed);
+        assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
+    #[test]
+    fn opening_clears_held_motion() {
+        let mut app = console_fixture();
+        app.insert_resource(WalkIntent {
+            wish_dir: Vec3::X,
+            target_speed: 300.0,
+            jump_pressed: true,
+        });
+        send_key(&mut app, KeyCode::Backquote);
+        app.update();
+        let intent = *app.world().resource::<WalkIntent>();
+        assert_eq!(intent.wish_dir, Vec3::ZERO);
+        assert_eq!(intent.target_speed, 0.0);
     }
 }

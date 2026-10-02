@@ -1,5 +1,6 @@
 use crate::{
     config::EngineConfig,
+    console::{ConsolePlugin, console_closed},
     metrics::AcceptanceMetricsPlugin,
     physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
     profiling::{ProfilingPlugin, ProfilingState},
@@ -162,11 +163,17 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ProfilingPlugin,
             RenderDiagnosticsPlugin,
         ))
-        .add_plugins((VercidiumRendererPlugin, SkyPlugin))
+        .add_plugins((VercidiumRendererPlugin, SkyPlugin, ConsolePlugin))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin)
-        .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
+        .add_systems(
+            Update,
+            (
+                fly_camera.run_if(console_closed),
+                capture_acceptance_screenshot,
+            ),
+        );
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
@@ -3002,5 +3009,46 @@ mod tests {
     fn terrain_water_fixture_layers_are_sampled_with_a_repeating_sampler() {
         let expected = bevy::image::ImageSampler::Descriptor(terrain_layer_sampler());
         assert_eq!(terrain_fixture_image([82, 116, 58, 255]).sampler, expected);
+    }
+    #[test]
+    fn fly_camera_stands_still_while_the_console_is_open() {
+        use crate::console::ConsoleState;
+        use bevy::time::TimeUpdateStrategy;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ProfilingState>()
+            .insert_resource(EngineConfig {
+                headless: true,
+                ..default()
+            })
+            .insert_resource(ConsoleState {
+                open: true,
+                ..default()
+            })
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(100),
+            ))
+            .add_systems(Update, fly_camera.run_if(console_closed));
+        let camera = app
+            .world_mut()
+            .spawn((StreamingCamera, Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Space);
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<Transform>(camera).unwrap().translation,
+            Vec3::ZERO
+        );
+        app.world_mut().resource_mut::<ConsoleState>().open = false;
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(app.world().get::<Transform>(camera).unwrap().translation.y > 0.0);
     }
 }
