@@ -1,6 +1,6 @@
 # OpenSkyrim SQLite 3 Database Schema (`skyrim_world.db`)
 
-This specification details the canonical DDL schema, tables, indices, and column constraints for `skyrim_world.db`, as implemented in [`crates/converter/src/esm/exporter.rs`](file:///C:/Users/lucas.augusto/Documents/programs/OpenSkyrim/crates/converter/src/esm/exporter.rs).
+This specification details the canonical DDL schema, tables, indices, and column constraints for `skyrim_world.db`, as implemented in [`crates/converter/src/esm/exporter.rs`](../../../crates/converter/src/esm/exporter.rs).
 
 ---
 
@@ -8,13 +8,15 @@ This specification details the canonical DDL schema, tables, indices, and column
 
 `skyrim_world.db` is built by `crates/converter` by parsing master files (`Skyrim.esm`) and plugin files (`.esp`/`.esl`). When `PipelineConfig.plugins_file` is supplied, its explicit order is validated and preserved. The CLI and launcher currently use automatic discovery: only plugins directly in Data are selected, with dependencies ordered before dependents. Among available plugins, ESM-flagged plugins and `.esm`/`.esl` files take priority, followed by the five official files' conventional order and case-insensitive filename order. The ESL header flag alone assigns a light slot; an ESL-flagged `.esp` stays among regular plugins. Missing masters and dependency cycles fail with diagnostics. This deterministic fallback cannot infer a user's intended override order between unrelated mods; nested backup/optional plugins are ignored while nested assets remain discoverable.
 
-The database stamps its own version in `schema_info`; the current one is **4**
-(`shared::WORLD_DATABASE_SCHEMA_VERSION`), which added the `lights` table and
+The database stamps its own version in `schema_info`; the current one is **5**
+(`shared::WORLD_DATABASE_SCHEMA_VERSION`), which adds `grass_types` and
+`landscape_texture_grasses`. Schema 4 added the `lights` table and
 `references.radius_override`. The runtime (engine and `world-inspect`) accepts world database
-schemas **3 through 4** (`shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION` through
+schemas **3 through 5** (`shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION` through
 `shared::WORLD_DATABASE_SCHEMA_VERSION`, checked by `shared::supports_runtime_world_database_schema`);
-schema 3 loads because every runtime query probes for the tables and columns schema 4 added. The
-launcher's "ready to play" check accepts the same range.
+older schemas load because optional consumers probe for the added tables and columns. The
+launcher's "ready to play" check accepts the same range. Reconversion populates the grass
+projections while mesh and texture outputs keep their existing conversion-cache identity.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -299,3 +301,66 @@ DefaultWater values (`render::DEFAULT_WATER_FRESNEL` / `render::DEFAULT_WATER_RE
 `streaming.rs`'s deep-colour constant) until a reconversion populates them. Adding them did **not**
 bump `shared::WORLD_DATABASE_SCHEMA_VERSION`: nothing that already reads `waters` depends on their
 presence, and the fallback exists specifically so a reconversion is not required.
+
+---
+
+### 14. Grass Definitions and Landscape Associations (`grass_types`, `landscape_texture_grasses`)
+
+`grass_types` projects each effective `GRAS` record, including its canonical converted
+model path (`MODL` through the existing mesh asset-path mapping). Grass models use the
+same NIF-to-GLB converter as other meshes. `flags` below contains the `DATA` grass
+flags rather than record header flags. `load_order` identifies the winning
+override; `formid_map` retains owning-plugin identity independently.
+
+The layout follows [xEdit's TES5 GRAS and LTEX definitions](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.5/Core/wbDefinitionsTES5.pas)
+and [CommonLibSSE-NG's TESGrass definition](https://github.com/CharmedBaryon/CommonLibSSE-NG/blob/main/include/RE/T/TESGrass.h).
+`DATA` is 32 bytes; its padding and unprojected fields stay in `records.data`.
+The converter preserves authored values without clamping to vanilla ranges. A field
+whose bytes are missing, or a non-finite float, becomes NULL. Missing, empty or unsafe
+model paths also become NULL; the original subrecords remain available for diagnostics.
+Path normalization does not verify that the referenced asset exists. Even vanilla
+records can name an absent mesh, so a non-NULL `model_path` is not an availability
+guarantee. Grass consumers must tolerate missing models, skip the unavailable
+model with a useful diagnostic, and continue processing other grass types.
+
+```sql
+CREATE TABLE IF NOT EXISTS grass_types (
+    id INTEGER PRIMARY KEY,            -- resolved GRAS FormID
+    editor_id TEXT,
+    model_path TEXT,                    -- canonical meshes/...glb from MODL
+    density INTEGER,                    -- DATA+0: u8
+    min_slope INTEGER,                  -- DATA+1: u8, degrees
+    max_slope INTEGER,                  -- DATA+2: u8, degrees
+    units_from_water INTEGER,           -- DATA+4: u16, distance from water level
+    water_comparison INTEGER,           -- DATA+8: u32, enum below
+    position_range REAL,                -- DATA+12: f32
+    height_range REAL,                  -- DATA+16: f32
+    color_range REAL,                   -- DATA+20: f32
+    wave_period REAL,                   -- DATA+24: f32
+    flags INTEGER,                     -- DATA+28: u8
+    load_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS landscape_texture_grasses (
+    ltex_id INTEGER NOT NULL,           -- resolved LTEX FormID
+    gras_id INTEGER NOT NULL,           -- resolved GNAM GRAS FormID
+    PRIMARY KEY (ltex_id, gras_id)
+);
+```
+
+`water_comparison` values 0 through 7 mean Above At Least, Above At Most,
+Below At Least, Below At Most, Either At Least, Either At Most,
+Either At Most Above and Either At Most Below, respectively. `flags` bits 0,
+1 and 2 mean Vertex Lighting, Uniform Scaling and Fit to Slope. These definitions
+establish the authored contract, not Skyrim's exact placement equations.
+
+Each non-null repeated `LTEX.GNAM` yields an association; duplicate pairs collapse.
+The winning LTEX list replaces the earlier list in full. There is no foreign key on
+the grass target: a deleted or unresolved grass can still be named by a texture,
+and consumers resolve it against `grass_types`. Both projections refresh atomically
+from a complete effective load-order export, removing stale grass and associations
+on deletions or later overrides. Deleted GRAS records therefore do not reappear as
+grass definitions. The subset export used by movement annotation preserves unrelated
+grass rows; if it includes an LTEX, only that texture's association list is replaced.
+Movement annotation continues to accept schema 4 through the current schema and
+preserves the existing database version; it does not perform a full reconversion.

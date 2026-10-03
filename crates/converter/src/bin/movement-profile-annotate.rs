@@ -1,4 +1,4 @@
-//! Add the selected movement projection to an existing schema-4 package.
+//! Add the selected movement projection to an existing schema-4 or newer compatible package.
 //! Reads the package's own winning raw records; no source plugin is reparsed.
 
 use color_eyre::{
@@ -13,6 +13,7 @@ use converter::esm::{
 use rusqlite::{Connection, params};
 use std::{collections::HashMap, path::PathBuf};
 
+/// Rebuilds the movement projection of the database named on the command line.
 fn main() -> Result<()> {
     color_eyre::install()?;
     let path = PathBuf::from(std::env::args_os().nth(1).ok_or_else(|| {
@@ -21,7 +22,7 @@ fn main() -> Result<()> {
     let conn = Connection::open(&path).wrap_err_with(|| format!("opening {}", path.display()))?;
     let version: u32 = conn.query_row("SELECT version FROM schema_info", [], |row| row.get(0))?;
     ensure!(
-        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        (4..=shared::WORLD_DATABASE_SCHEMA_VERSION).contains(&version),
         "database schema {version} is unsupported"
     );
     let mut selected = HashMap::new();

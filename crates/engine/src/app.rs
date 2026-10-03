@@ -3051,6 +3051,7 @@ mod tests {
         }
     }
 
+    /// Current, complete assets load, and an integration report newer than the engine is rejected.
     #[test]
     fn accepts_current_complete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
@@ -3079,14 +3080,20 @@ mod tests {
         validate_runtime_assets(&config).unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":5,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+            ),
         )
         .unwrap();
         assert!(
             validate_runtime_assets(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("schema 5 is unsupported")
+                .contains(&format!(
+                    "schema {} is unsupported",
+                    shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+                ))
         );
     }
 

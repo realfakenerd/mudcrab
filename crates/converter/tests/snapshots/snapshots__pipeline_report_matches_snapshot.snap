@@ -38,7 +38,7 @@ expression: report
     "missing_texture_count": 0,
     "passed": true,
     "references_total": 9,
-    "schema_version": 4,
+    "schema_version": 5,
     "statics_total": 1,
     "statics_with_models": 1,
     "terrain_cells": 9,

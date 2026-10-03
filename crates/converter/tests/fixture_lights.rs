@@ -363,8 +363,9 @@ fn generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override()
         })
         .unwrap();
     assert_eq!(
-        version, 4,
-        "the lights table and the radius_override column are schema 4"
+        version,
+        shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "the database stamps the current shared world schema"
     );
     // The exporter's stamp and the contract the engine checks are one version.
     validate_database(&connection).unwrap();

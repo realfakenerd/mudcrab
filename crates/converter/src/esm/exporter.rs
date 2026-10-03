@@ -86,11 +86,11 @@ fn optional_race_movement_link(
     Ok((value != 0).then_some(value))
 }
 
+/// Creates any missing world-database tables and stamps an empty database with the current schema.
 pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
-         INSERT INTO schema_info(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
          CREATE TABLE IF NOT EXISTS plugins (
              id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, priority INTEGER NOT NULL, checksum BLOB NOT NULL
          );
@@ -180,6 +180,17 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              id INTEGER PRIMARY KEY, editor_id TEXT, texture_set_id INTEGER,
              material_type INTEGER, friction REAL, restitution REAL
          );
+         CREATE TABLE IF NOT EXISTS grass_types (
+             id INTEGER PRIMARY KEY, editor_id TEXT, model_path TEXT,
+             density INTEGER, min_slope INTEGER, max_slope INTEGER,
+             units_from_water INTEGER, water_comparison INTEGER,
+             position_range REAL, height_range REAL, color_range REAL,
+             wave_period REAL, flags INTEGER, load_order INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS landscape_texture_grasses (
+             ltex_id INTEGER NOT NULL, gras_id INTEGER NOT NULL,
+             PRIMARY KEY (ltex_id, gras_id)
+         );
          CREATE TABLE IF NOT EXISTS scripts (
              form_id INTEGER NOT NULL, script_name TEXT NOT NULL,
              vmad BLOB NOT NULL, properties_json TEXT NOT NULL,
@@ -192,18 +203,24 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
          );"#
     )?;
+    conn.execute(
+        "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
+        [shared::WORLD_DATABASE_SCHEMA_VERSION],
+    )?;
     Ok(())
 }
 
 type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 
-/// Refresh projections without changing existing provenance. Synthetic records
-/// without a source load order have no formid_map entry; never invent an owner.
+/// Export selected records without changing existing provenance. Grass records
+/// outside this subset are preserved; movement projections are rebuilt from it.
+/// Synthetic records without a source load order have no formid_map entry.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
     export_records(conn, master, None)
 }
 
-/// Export stable owning-plugin/local-ID pairs separately from the winning
+/// Export a complete effective load order, replacing both grass projections.
+/// Record stable owning-plugin/local-ID pairs separately from the winning
 /// override priority in records.load_order.
 pub fn export_to_db_with_load_order(
     conn: &Connection,
@@ -224,6 +241,19 @@ fn export_records(
     tx.execute("DELETE FROM movement_types", [])?;
     tx.execute("DELETE FROM movement_game_settings", [])?;
     tx.execute("DELETE FROM race_movement_links", [])?;
+    // Only the load-order export owns a complete snapshot. The movement
+    // annotator uses export_to_db with a subset and must retain unrelated grass
+    // and the database's existing schema stamp.
+    if order.is_some() {
+        // A reused older database gains the current tables in create_tables;
+        // stamp it inside this transaction so a failed export keeps the old one.
+        tx.execute(
+            "UPDATE schema_info SET version=?1",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )?;
+        tx.execute("DELETE FROM landscape_texture_grasses", [])?;
+        tx.execute("DELETE FROM grass_types", [])?;
+    }
     let mut cells: HashMap<u32, CellMetadata> = HashMap::new();
 
     for (&form_id, record) in master
@@ -284,6 +314,9 @@ fn export_records(
         }
 
         match type_str {
+            "GRAS" => {
+                insert_grass(&tx, form_id, &view, record.load_order)?;
+            }
             "WRLD" => {
                 let view = SubrecordView::new(&record.subrecords);
                 let editor_id = view
@@ -435,11 +468,69 @@ fn export_records(
                     "INSERT OR REPLACE INTO landscape_textures(id,editor_id,texture_set_id,material_type,friction,restitution) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![form_id, view.get_string(b"EDID"), view.get_form_id(b"TNAM"), view.get_form_id(b"MNAM"), friction, restitution],
                 )?;
+                // An included LTEX always replaces its own list, including an
+                // empty list, even when other records are outside this export.
+                tx.execute(
+                    "DELETE FROM landscape_texture_grasses WHERE ltex_id=?1",
+                    [form_id],
+                )?;
+                for (_, data) in record.subrecords.iter().filter(|(tag, _)| tag == b"GNAM") {
+                    if let Ok(bytes) = <[u8; 4]>::try_from(data.as_slice()) {
+                        let grass_id = u32::from_le_bytes(bytes);
+                        if grass_id != 0 {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO landscape_texture_grasses(ltex_id, gras_id) VALUES (?1, ?2)",
+                                params![form_id, grass_id],
+                            )?;
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
     tx.commit()
+}
+
+/// Projects xEdit's TES5 GRAS/DATA layout without inventing missing fields.
+/// The complete payload is 32 bytes; unknown padding stays in records.data.
+/// See the primary definitions linked in the database schema specification.
+fn insert_grass(
+    tx: &Transaction<'_>,
+    form_id: u32,
+    view: &SubrecordView<'_>,
+    load_order: u32,
+) -> Result<()> {
+    let data = view.find(b"DATA").unwrap_or_default();
+    let float = |offset| {
+        data.get(offset..offset + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(f32::from_le_bytes)
+            .filter(|value| value.is_finite())
+    };
+    let model = view
+        .get_string(b"MODL")
+        .and_then(|path| canonical_asset_path(&path, AssetKind::Mesh, "glb").ok());
+    tx.execute(
+        "INSERT OR REPLACE INTO grass_types(id, editor_id, model_path, density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags, load_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            form_id,
+            view.get_string(b"EDID"),
+            model,
+            data.first().copied(),
+            data.get(1).copied(),
+            data.get(2).copied(),
+            data.get(4..6).and_then(|bytes| <[u8; 2]>::try_from(bytes).ok()).map(u16::from_le_bytes),
+            data.get(8..12).and_then(|bytes| <[u8; 4]>::try_from(bytes).ok()).map(u32::from_le_bytes),
+            float(12),
+            float(16),
+            float(20),
+            float(24),
+            data.get(28).copied(),
+            load_order,
+        ],
+    )?;
+    Ok(())
 }
 
 fn water_flow_normal_path(view: &SubrecordView<'_>) -> Option<String> {
@@ -633,6 +724,7 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The schema has the interior index, the exterior spatial table and every projection table.
     #[test]
     fn creates_hybrid_spatial_schema() {
         let conn = Connection::open_in_memory().unwrap();
@@ -667,6 +759,8 @@ mod tests {
             "waters",
             "texture_sets",
             "landscape_textures",
+            "grass_types",
+            "landscape_texture_grasses",
         ] {
             let present: i64 = conn
                 .query_row(

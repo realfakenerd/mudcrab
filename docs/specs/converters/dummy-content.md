@@ -101,7 +101,7 @@ Supported writers:
   (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`), or with a `LIGH` base record whose
   `DATA` is the 48-byte layout `Skyrim.esm` uses, an `FNAM` fade and one reference carrying an
   `XRDS` radius override (`esm::PRESET_LIGHT`, `esm::plugin_with_lights`). Exports into
-  `skyrim_world.db` (schema 4) and `cell_cache.rkyv`.
+  `skyrim_world.db` (schema 5, `shared::WORLD_DATABASE_SCHEMA_VERSION`) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal. `layout::generate`
   writes the default tree and `layout::write_plugin` publishes a caller-built `Skyrim.esm` —
   the interior preset included — through the same writer and the same constants
