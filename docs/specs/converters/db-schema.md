@@ -215,6 +215,61 @@ header-only deletion is skipped with a warning. Later restorations keep the
 original identity. Ambiguous aliases and live settings without an EDID are
 errors, rather than silently replacing or dropping another record.
 
+Known FormID fields inside the published subrecord blobs (`records.data`,
+`cells.data`, `references.data`) are rewritten into the same load-order numbering
+as the record keys, so a consumer can look them up directly. That covers the
+single-FormID fields in the converter's `is_form_id_subrecord`, the
+LAND/GRAS/LTEX payloads, the primary VMAD script-property references, and these
+reference and cell fields, validated against their expected sizes:
+
+| Field | Records | FormIDs |
+| --- | --- | --- |
+| `XTEL` | placed references | door destination reference (bytes 0-3 of 32) |
+| `XESP` | placed references | enable parent (bytes 0-3 of 8; flags and unused bytes preserved) |
+| `XLKR` | placed references | keyword and linked reference (8 bytes), or the linked reference alone (legacy 4 bytes) |
+| `XNDP` | placed references | navmesh (bytes 0-3 of 8) |
+| `XEMI` | placed references | emitted light or region |
+| `XAPR` | placed references | activate-parent reference (one 8-byte subrecord per parent) |
+| `XLRT` | placed references | location reference types (array) |
+| `XHOR` | ACHR | horse reference |
+| `LTMP` | CELL, WRLD | lighting template |
+| `XCIM`, `XCMO`, `XCAS` | CELL | image space, music type, acoustic space |
+| `XCCM` | CELL | region the cell takes its sky and weather from |
+| `XCLR` | CELL | regions (array) |
+
+For blob remapping, placed references are REFR, ACHR, ACRE, PGRE, PMIS, PHZD,
+PARW, PBAR, PBEA, PCON and PFLA. This does not expand the record types exported
+to the `references` table; the six newly covered types retain their blobs in
+`records` without adding `references` rows.
+Fields not covered may still hold plugin-local FormIDs. In particular, do not
+consume `WRLD.RNAM` large-reference lists, `XLOC` lock keys, `XPWR` water
+reflections, or `XPOD`/`XLRM` room and portal links as resolved IDs. Other
+unconverted fields include `XLIB`, `XMBR`, `XATR`, `XTNM`, `PDTO`, `CELL.XILL`
+and `WRLD.ZNAM`. Check the converter's field-specific handling before using
+these payloads; this list is not exhaustive.
+
+The fields in this table validate master indices and light-plugin local IDs.
+An out-of-range index or light-plugin local ID wider than 12 bits is an invalid
+optional link: the converter sets that FormID to zero and reports a warning,
+aggregated per source plugin with the count and first record/field diagnostic.
+Other records and valid links continue to convert. Malformed field lengths still
+fail conversion, since their FormID offsets cannot be decoded safely. Existing
+validation of record headers and required fields is unchanged. Zero FormIDs
+remain zero. Other bytes (such as teleport coordinates, enable flags, navmesh
+triangles and activation delays) are preserved. Unlisted fields remain opaque,
+not an assurance that all FormIDs in arbitrary Skyrim or mod subrecords have
+been resolved.
+
+Existing packs must be converted again to obtain these corrected links. This
+does not change the schema-4 table or blob layout, so the database and asset
+cache versions are unchanged. Every pipeline run, including resume, rebuilds
+the database from source plugins while reusing unaffected assets. Old packs
+are still accepted by the runtime: schema 4 alone does not certify these links
+were remapped. A future consumer of these fields must account for old packs.
+`export_to_db` without a load order refreshes already-resolved records (for
+example movement annotations), preserving established `formid_map` ownership;
+it neither resolves plugin-local IDs nor upgrades an old pack.
+
 ```sql
 CREATE TABLE IF NOT EXISTS formid_map (
     form_id INTEGER PRIMARY KEY,       -- Resolved 32-bit Skyrim FormID
