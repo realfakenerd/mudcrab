@@ -506,6 +506,7 @@ fn setup_physics_fixture(
 
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(0.0, 900.0, 1900.0).looking_at(Vec3::new(0.0, 0.0, -200.0), Vec3::Y),
         StreamingCamera,
     ));
@@ -1331,6 +1332,12 @@ mod simulation_tests {
             .query_filtered::<&KinematicCharacterControllerOutput, With<PlayerBody>>();
         let actual = actual_walk_speed(query.single(app.world()).ok());
         assert!(sprint_target > 0.0 && actual < 1.0, "actual {actual}");
+    }
+
+    #[test]
+    fn v1_physics_fixture_camera_has_explicit_hdr_output() {
+        let mut app = headless::fixture_app();
+        crate::color_pipeline::assert_scene_camera_output(app.world_mut(), 1);
     }
 
     #[test]

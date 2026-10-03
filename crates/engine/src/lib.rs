@@ -1,4 +1,5 @@
 pub mod app;
+pub mod color_pipeline;
 pub mod config;
 pub mod lights;
 pub mod metrics;

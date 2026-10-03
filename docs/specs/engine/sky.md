@@ -38,6 +38,11 @@ The converted `atmosphere.glb` keeps no vertex colours, so the engine builds the
 
 ## What the engine does
 
+Scene cameras now compose sky, background and fog with surfaces in HDR, then apply one shared
+display transform. See [L1 color pipeline](color-pipeline.md) for domains, tests and remaining
+parity gaps. Existing encoded weather mixing and fog equations remain provisional pending retail
+comparison; the output correction does not validate those assumptions.
+
 - **Colours.** `SkyPalette` holds Sky-Upper, Sky-Lower, Horizon and Fog Far, plus a linear
   brightness scale. The built-in palette is `SkyrimClear`'s day column (Upper 21,77,117;
   Lower 60,135,183; Horizon 125,163,183; Fog Far 116,168,203, 8-bit sRGB). The table above is

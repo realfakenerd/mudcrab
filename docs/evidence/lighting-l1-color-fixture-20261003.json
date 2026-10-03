@@ -1,0 +1,51 @@
+{
+  "source_commit": "035c4e9e1e7de46c9f8ced75f6d4b874e0083348",
+  "scene": "existing --terrain-water-fixture",
+  "resolution": [
+    1600,
+    900
+  ],
+  "camera_position": [
+    2048,
+    1800,
+    2600
+  ],
+  "camera_target": [
+    2048,
+    0,
+    -2048
+  ],
+  "ev100": 9.7,
+  "tonemapping": "TonyMcMapface",
+  "water_animation_time": 1.0,
+  "device": "llvmpipe Vulkan / Mesa 26.2.2",
+  "diagnostic_overrides": [
+    "WebGPU feature priority with sampled-texture and sampler limits raised to 32 in both runs",
+    "Screenshot readiness omits production renderer/performance gate in both runs; fixture asset readiness retained"
+  ],
+  "before": "Remove explicit scene HDR bundles and restore Rgba8Unorm reflection with sRGB view, as in pre-137 output path",
+  "after": "Production HDR bundles and Rgba16Float linear reflection",
+  "limitations": [
+    "Fixture has terrain and water but no SkyCamera; synthetic composition probe separately covers sky",
+    "Xvfb surface emitted Vulkan swapchain semaphore validation diagnostics in both runs",
+    "Both software-rendered benchmark performance gates fail; captures are visual review evidence only",
+    "No retail Skyrim comparison or Fiji production validation of these review follow-ups"
+  ],
+  "frames": {
+    "before": {
+      "sha256": "722f82950ae31d6c5c920595f653acb6b16711728ca7b0cf629ebc2b9a472519"
+    },
+    "after": {
+      "sha256": "25606327d8cd0a14737253d6267ca1ed6a3bfffaaf5727eb94ee333797d79baa"
+    }
+  },
+  "mean_absolute_channel_difference_u8": [
+    1.769223611111111,
+    1.7428097222222223,
+    1.74810625
+  ],
+  "private_patch_sha256": {
+    "software-fixture.patch": "6c872fe0b7acfce3f583786b5500fea178094a9aed427c9961ba9db74f872ca5",
+    "legacy-fixture.patch": "4901df15d37f993a661b7563d9d5e15fcb8525bace7836a33163fcb13bb4004a"
+  }
+}
