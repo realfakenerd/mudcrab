@@ -134,7 +134,7 @@ pub struct ClockText;
 #[derive(Component, Default, Clone)]
 pub struct FileText;
 
-/// The scrolling box around the notices, so a long check result scrolls instead of spilling out
+/// The scrolling box around the notices, so a long result scrolls instead of spilling out
 /// of the panel.
 #[derive(Component, Default, Clone)]
 pub struct NoticePane;
@@ -562,7 +562,7 @@ pub fn draw_bar(
 }
 
 /// Draws the three status lines and the notices. When the notices change, the pane scrolls to
-/// where the news is: the top for a check's result, which reads from its first line, and the end
+/// where the news is: the top for a completed result, which reads from its first line, and the end
 /// for anything else, whose newest line is last.
 pub fn draw_labels(
     status: Res<ConversionStatus>,
@@ -587,7 +587,7 @@ pub fn draw_labels(
         }
     }
     if changed {
-        let y = if status.check.is_some() {
+        let y = if status.check.is_some() || status.run_finished {
             0.0
         } else {
             SCROLL_TO_END
@@ -720,6 +720,27 @@ mod tests {
             .spawn_scene(conversion_panel())
             .expect("the panel scene spawns");
         app
+    }
+
+    #[test]
+    fn completed_run_scrolls_to_summary_and_keeps_lod_warnings() {
+        let data = data_folder("lod-result-scroll");
+        let mut app = panel_app(&data);
+        let mut status = ConversionStatus::default();
+        let lines: Vec<_> = std::iter::once("Conversion complete".to_owned())
+            .chain((0..12).map(|i| format!("LOD warning {i}")))
+            .collect();
+        status.finish_run(&lines);
+        app.insert_resource(status).add_systems(Update, draw_labels);
+        app.update();
+        let world = app.world_mut();
+        let mut pane = world.query_filtered::<&ScrollPosition, With<NoticePane>>();
+        assert_eq!(pane.single(world).unwrap().0.y, 0.0);
+        let mut text = world.query_filtered::<&Text, With<NoticeText>>();
+        let result = &text.single(world).unwrap().0;
+        assert!(result.starts_with("Conversion complete"));
+        assert!(result.contains("LOD warning 0"));
+        assert!(result.contains("LOD warning 11"));
     }
 
     /// Which buttons are drawn as available, read from their colours after a frame.

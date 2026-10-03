@@ -207,6 +207,14 @@ pub struct Light<'a> {
     /// an override.
     /// A single little-endian `f32`, which may be negative.
     pub radius_override: f32,
+    /// Header flag word of the reference. Zero for an always-on placement;
+    /// `0x800` marks it initially disabled, the state whose extraction the
+    /// LOD eligibility fixtures cover.
+    pub reference_flags: u32,
+    /// `XESP` enable parent: the parent reference's FormID plus the XESP flag
+    /// word (bit 0 inverts the parent's state). `None` writes no `XESP`, the
+    /// shape of an unconditionally enabled placement.
+    pub enable_parent: Option<(u32, u32)>,
 }
 
 /// Description of a generated plugin.
@@ -675,15 +683,21 @@ fn light_reference_record(form_id: u32, light: &Light<'_>) -> Result<Vec<u8>> {
     for value in light.position.iter().chain(light.rotation.iter()) {
         data.extend_from_slice(&value.to_le_bytes());
     }
-    record(
-        *b"REFR",
-        form_id,
-        &[
-            (*b"NAME", LIGHT_FORM_ID.to_le_bytes().to_vec()),
-            (*b"DATA", data),
-            (*b"XRDS", light.radius_override.to_le_bytes().to_vec()),
-        ],
-    )
+    let mut subrecords = vec![
+        (*b"NAME", LIGHT_FORM_ID.to_le_bytes().to_vec()),
+        (*b"DATA", data),
+        (*b"XRDS", light.radius_override.to_le_bytes().to_vec()),
+    ];
+    // `XESP`: parent FormID then the flag word (bit 0 inverts). Written only
+    // when the spec names a parent, so the default reference stays an
+    // unconditionally enabled placement.
+    if let Some((parent, flags)) = light.enable_parent {
+        let mut xesp = Vec::with_capacity(8);
+        xesp.extend_from_slice(&parent.to_le_bytes());
+        xesp.extend_from_slice(&flags.to_le_bytes());
+        subrecords.push((*b"XESP", xesp));
+    }
+    record_with_flags(*b"REFR", form_id, light.reference_flags, &subrecords)
 }
 
 /// The interior cell group: `GRUP` type 2 (interior block) around type 3
@@ -728,6 +742,19 @@ fn cell_form_id(index: usize) -> Result<u32> {
 }
 
 fn record(tag: [u8; 4], form_id: u32, subrecords: &[([u8; 4], Vec<u8>)]) -> Result<Vec<u8>> {
+    record_with_flags(tag, form_id, 0, subrecords)
+}
+
+/// A record with an explicit header flag word. The stock [`record`] writes
+/// zero flags, which is what every existing fixture needs; references that
+/// exercise enable state (initially-disabled, XESP followers) need their
+/// real flags on the wire.
+fn record_with_flags(
+    tag: [u8; 4],
+    form_id: u32,
+    flags: u32,
+    subrecords: &[([u8; 4], Vec<u8>)],
+) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     for (sub_tag, data) in subrecords {
         let length = u16::try_from(data.len())
@@ -743,7 +770,7 @@ fn record(tag: [u8; 4], form_id: u32, subrecords: &[([u8; 4], Vec<u8>)]) -> Resu
             .map_err(|_| eyre!("ESM record payload overflow"))?
             .to_le_bytes(),
     );
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&flags.to_le_bytes());
     bytes.extend_from_slice(&form_id.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&RECORD_VERSION.to_le_bytes());
@@ -850,6 +877,8 @@ pub const PRESET_LIGHT: Light<'static> = Light {
     position: [1024.0, 2048.0, 128.0],
     rotation: [0.0, 0.0, 0.0],
     radius_override: 1024.0,
+    reference_flags: 0,
+    enable_parent: None,
 };
 
 #[cfg(test)]

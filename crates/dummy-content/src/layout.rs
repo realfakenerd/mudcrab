@@ -94,6 +94,8 @@ pub struct Formats {
     pub ba2: bool,
     /// A `Skyrim.esm` plugin with a generated worldspace.
     pub esm: bool,
+    /// `lodsettings/GeneratedWorld.lod` origin/grid sidecar; requires `esm`.
+    pub lodsettings: bool,
 }
 
 impl Default for Formats {
@@ -113,10 +115,11 @@ impl Formats {
             bsa: true,
             ba2: true,
             esm: true,
+            lodsettings: true,
         }
     }
 
-    /// Parses a comma-separated list such as `dds,pex,nif,bsa,ba2,esm`.
+    /// Parses a comma-separated list such as `dds,pex,nif,bsa,ba2,esm,lodsettings`.
     pub fn parse(value: &str) -> Result<Self> {
         let mut formats = Self {
             dds: false,
@@ -125,6 +128,7 @@ impl Formats {
             bsa: false,
             ba2: false,
             esm: false,
+            lodsettings: false,
         };
         for name in value.split(',') {
             match name.trim() {
@@ -134,15 +138,28 @@ impl Formats {
                 "bsa" => formats.bsa = true,
                 "ba2" => formats.ba2 = true,
                 "esm" => formats.esm = true,
+                "lodsettings" => formats.lodsettings = true,
                 "" => bail!("empty format name in {value:?}"),
                 other => {
-                    bail!("unknown format {other:?}; expected dds, pex, nif, bsa, ba2 or esm")
+                    bail!(
+                        "unknown format {other:?}; expected dds, pex, nif, bsa, ba2, esm or lodsettings"
+                    )
                 }
             }
         }
         ensure!(
-            formats.dds || formats.pex || formats.nif || formats.bsa || formats.ba2 || formats.esm,
+            formats.dds
+                || formats.pex
+                || formats.nif
+                || formats.bsa
+                || formats.ba2
+                || formats.esm
+                || formats.lodsettings,
             "no output formats selected"
+        );
+        ensure!(
+            !formats.lodsettings || formats.esm,
+            "lodsettings format requires esm"
         );
         Ok(formats)
     }
@@ -181,6 +198,10 @@ pub fn prepare_directory(root: &Path, force: bool) -> Result<()> {
 /// archives, and a `Skyrim.esm` plugin with a generated worldspace, filtered
 /// by `formats`. Output bytes are fully determined by `seed`.
 pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>> {
+    ensure!(
+        !formats.lodsettings || formats.esm,
+        "lodsettings format requires esm"
+    );
     let mut rng = Rng::new(seed);
     let scripts = [
         ("scripts/generated.pex", pex::minimal("Generated")?),
@@ -272,7 +293,30 @@ pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>
     if let Some(bytes) = &plugin {
         written.push(write_plugin(root, bytes)?);
     }
+    // The generated worldspace spans cells -1..=1 on both axes; its LOD
+    // origin sits at the southwest corner with room to grow, the way a real
+    // sidecar's grid covers its world's cells.
+    if formats.lodsettings && formats.esm {
+        written.push(write_file(
+            root,
+            &format!("lodsettings/{GENERATED_WORLDSPACE}.lod"),
+            &lodsettings_file(-4, -4, 32, 4, 32),
+        )?);
+    }
     Ok(written)
+}
+
+/// Skyrim's two `i16` origins and three `i32` grid fields (`xEdit wbLOD.pas`).
+fn lodsettings_file(x: i16, y: i16, stride: i32, min_level: i32, max_level: i32) -> Vec<u8> {
+    x.to_le_bytes()
+        .into_iter()
+        .chain(y.to_le_bytes())
+        .chain(
+            [stride, min_level, max_level]
+                .into_iter()
+                .flat_map(i32::to_le_bytes),
+        )
+        .collect()
 }
 
 /// Writes `Skyrim.esm` under `root` and returns the path it published.
@@ -377,7 +421,7 @@ fn ensure_no_symlink_components(root: &Path, relative: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const EXPECTED_FILES: [&str; 12] = [
+    const EXPECTED_FILES: [&str; 13] = [
         "scripts/generated.pex",
         "scripts/second.pex",
         "textures/generated_color.dds",
@@ -390,6 +434,7 @@ mod tests {
         "Skyrim - Meshes.bsa",
         "Skyrim - Textures.ba2",
         "Skyrim.esm",
+        "lodsettings/GeneratedWorld.lod",
     ];
 
     #[test]
@@ -403,15 +448,29 @@ mod tests {
                 bsa: false,
                 ba2: false,
                 esm: false,
+                lodsettings: false,
             }
         );
         assert_eq!(
-            Formats::parse("dds, pex,nif,bsa ,ba2,esm").unwrap(),
+            Formats::parse("dds, pex,nif,bsa ,ba2,esm,lodsettings").unwrap(),
             Formats::all()
         );
-        for value in ["", "dds,", "foo", "dds,foo"] {
+        for value in ["", "dds,", "foo", "dds,foo", "lodsettings"] {
             assert!(Formats::parse(value).is_err(), "{value:?} was accepted");
         }
+    }
+
+    #[test]
+    fn test_v1_lodsettings_selector_requires_generated_worldspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut formats = Formats::all();
+        formats.esm = false;
+        let error = generate(&temp.path().join("Data"), DEFAULT_SEED, formats).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lodsettings format requires esm")
+        );
     }
 
     #[test]
@@ -436,6 +495,10 @@ mod tests {
         for relative in EXPECTED_FILES {
             assert!(root.join(relative).is_file(), "missing {relative}");
         }
+        assert_eq!(
+            fs::read(root.join("lodsettings/GeneratedWorld.lod")).unwrap(),
+            vec![0xfc, 0xff, 0xfc, 0xff, 32, 0, 0, 0, 4, 0, 0, 0, 32, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -568,6 +631,7 @@ mod tests {
             bsa: true,
             ba2: false,
             esm: false,
+            lodsettings: false,
         };
         let written = generate(&root, DEFAULT_SEED, formats).unwrap();
         assert_eq!(written.len(), 4);

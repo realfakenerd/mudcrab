@@ -213,6 +213,8 @@ async fn no_plugins_converts_assets_without_warning_or_database() {
         layout::DEFAULT_SEED,
         layout::Formats {
             esm: false,
+            // The LOD settings sidecar describes the plugin's worldspace.
+            lodsettings: false,
             ..layout::Formats::all()
         },
     )

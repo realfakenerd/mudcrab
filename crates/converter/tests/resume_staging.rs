@@ -251,6 +251,88 @@ async fn reuses_a_staged_output_whose_provenance_is_current() {
 }
 
 #[tokio::test]
+async fn changed_malformed_nif_does_not_publish_the_previous_staged_glb() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    let output = temp.path().join("modern");
+    let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
+    fs::create_dir_all(data.join("meshes")).unwrap();
+    fs::create_dir_all(staging.join("meshes")).unwrap();
+    let source = data.join("meshes/one.nif");
+    let valid_nif = dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
+        name: "One",
+        positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: &[[0.0, 0.0, 1.0]; 3],
+        uvs: &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: &[[0, 1, 2]],
+        diffuse: "textures/one.dds",
+        normal_texture: "textures/one_n.dds",
+    })
+    .unwrap();
+    fs::write(&source, &valid_nif).unwrap();
+
+    let staged_glb = staging.join("meshes/one.glb");
+    converter::mesh::MeshConverter::convert_nif_to_glb(&source, &staged_glb).unwrap();
+    let output_bytes = fs::read(&staged_glb).unwrap();
+    let config = PipelineConfig::new(&data, &output);
+    let mut journal = StagingJournal::open(&staging).unwrap();
+    journal
+        .record(
+            "meshes/one.nif",
+            &StagedOutput {
+                schema_version: CONVERTER_SCHEMA_VERSION,
+                configuration_hash: configuration_hash(&config).unwrap(),
+                source_hash: hash_bytes(&valid_nif),
+                output_size: output_bytes.len() as u64,
+                output_hash: hash_bytes(&output_bytes),
+            },
+        )
+        .unwrap();
+
+    fs::write(&source, b"malformed NIF bytes").unwrap();
+    let mut resumed = config;
+    resumed.resume_staging = Some(staging);
+    resumed.fail_fast = false;
+    let report = AssetPipeline::run_async(resumed, progress_channel())
+        .await
+        .unwrap();
+
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 1);
+    assert!(
+        !output.join("meshes/one.glb").exists(),
+        "the old staged GLB was published after conversion of the changed NIF failed"
+    );
+}
+
+#[tokio::test]
+async fn fails_even_without_fail_fast_when_invalid_staged_output_cannot_be_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    let output = temp.path().join("modern");
+    let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
+    fs::create_dir_all(data.join("meshes")).unwrap();
+    fs::create_dir_all(staging.join("meshes/one.glb")).unwrap();
+    fs::write(data.join("meshes/one.nif"), b"malformed NIF bytes").unwrap();
+    let mut config = PipelineConfig::new(&data, &output);
+    config.resume_staging = Some(staging);
+    config.fail_fast = false;
+
+    let error = AssetPipeline::run_async(config, progress_channel())
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("failed to remove invalid staged output"),
+        "unexpected resume error: {error:#}"
+    );
+    assert!(
+        !output.exists(),
+        "a run with an unremovable output was published"
+    );
+}
+
+#[tokio::test]
 async fn does_not_publish_the_staging_journal() {
     let fixture = Fixture::new();
     fixture.write_source("One");

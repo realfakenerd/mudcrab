@@ -40,7 +40,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 ```
 
 - `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
-- `--formats dds,pex,nif,bsa,ba2,esm` — restrict output. The default generates everything.
+- `--formats dds,pex,nif,bsa,ba2,esm,lodsettings` — restrict output. The default generates everything. `lodsettings` requires `esm`.
 - `--force` — allow writing into a non-empty directory. Existing generated files are replaced
   atomically; unrelated files are left untouched. Generation refuses to follow symlinked path
   components.
@@ -71,6 +71,7 @@ The `esm` format has to be included for either.
 | `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
 | `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
 | `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. With `--with-interior`, one exterior cell, an interior cell and a reciprocal `DOOR`/`XTEL` pair instead. With `--with-lights`, one exterior cell, one `LIGH` base record and the one `REFR` that places it with an `XRDS` radius override. |
+| `lodsettings/GeneratedWorld.lod` | 16-byte Skyrim sidecar: `i16 X/Y`, then `i32 stride/min-level/max-level`. |
 
 ## Library API
 
@@ -172,3 +173,8 @@ Property tests (`proptest`, fixed seed, run by the normal test suite) extend tho
 ESM, VMAD, LAND, BSA, BA2, PEX, LIP and NIF parsers must return an error, never panic or abort,
 on arbitrary bytes and on generated fixtures with overwritten bytes, extreme size and count
 words, and truncation. Shared strategies live in `crates/converter/src/test_strategies.rs`.
+
+## Regression invariant
+
+- §B1 (2026-09-28): The LOD sidecar parser and writer referenced a selector missing from `Formats`, which stopped the workspace from compiling.
+- §V1: Every generated format is represented by `Formats`, `Formats::parse`, `Formats::all`, and the output filter; `lodsettings` requires `esm`. The layout tests cover the default tree, sidecar bytes, and invalid dependency.

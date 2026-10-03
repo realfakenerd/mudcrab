@@ -2842,6 +2842,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "shared",
  "tempfile",
  "windows-sys 0.61.2",

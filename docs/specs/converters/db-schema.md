@@ -8,13 +8,14 @@ This specification details the canonical DDL schema, tables, indices, and column
 
 `skyrim_world.db` is built by `crates/converter` by parsing master files (`Skyrim.esm`) and plugin files (`.esp`/`.esl`). When `PipelineConfig.plugins_file` is supplied, its explicit order is validated and preserved. The CLI and launcher currently use automatic discovery: only plugins directly in Data are selected, with dependencies ordered before dependents. Among available plugins, ESM-flagged plugins and `.esm`/`.esl` files take priority, followed by the five official files' conventional order and case-insensitive filename order. The ESL header flag alone assigns a light slot; an ESL-flagged `.esp` stays among regular plugins. Missing masters and dependency cycles fail with diagnostics. This deterministic fallback cannot infer a user's intended override order between unrelated mods; nested backup/optional plugins are ignored while nested assets remain discoverable.
 
-The database stamps its own version in `schema_info`; the current one is **4**
-(`shared::WORLD_DATABASE_SCHEMA_VERSION`), which added the `lights` table and
-`references.radius_override`. The runtime (engine and `world-inspect`) accepts world database
-schemas **3 through 4** (`shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION` through
-`shared::WORLD_DATABASE_SCHEMA_VERSION`, checked by `shared::supports_runtime_world_database_schema`);
-schema 3 loads because every runtime query probes for the tables and columns schema 4 added. The
-launcher's "ready to play" check accepts the same range.
+The database stamps its version in `schema_info`; the current version is **5**
+(`shared::WORLD_DATABASE_SCHEMA_VERSION`). Schema 4 added lights and
+`references.radius_override`; schema 5 adds LOD origins, chunk metadata,
+its spatial index, and a build identity. The engine, `world-inspect` and
+launcher accept world schemas **3 through 5**, using
+`shared::supports_runtime_world_database_schema`. Complete converter packages
+support schemas **15 through 17**. Legacy worlds render full detail without
+LOD; an advertised LOD package requires the current database contract.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -27,7 +28,7 @@ launcher's "ready to play" check accepts the same range.
 │  │   (Cell Grid & Names)    │   (3D World Placements)│ (3D Spatial R-Tree) │  │
 │  ├──────────────────────────┼──────────────────────┼─────────────────────┤  │
 │  │   `land`                 │   `lod`              │ `scripts`           │  │
-│  │   (Terrain Heightmaps)   │   (Mesh LOD Levels)  │ (Papyrus Bytecode)  │  │
+│  │   (Terrain Heightmaps)   │  (Unused LOD Table)  │ (Papyrus Bytecode)  │  │
 │  ├──────────────────────────┴──────────────────────┴─────────────────────┤  │
 │  │   `formid_map` & `conversion_cache`                                   │  │
 │  │   (32-bit to 64-bit ID Bridge & Cache Hashes)                        │  │
@@ -81,7 +82,9 @@ CREATE TABLE IF NOT EXISTS worldspaces (
     id INTEGER PRIMARY KEY,             -- WorldSpace FormID
     editor_id TEXT NOT NULL,            -- EDID string (e.g. 'Tamriel')
     parent_world INTEGER,               -- Parent WorldSpace FormID (if child worldspace)
-    flags INTEGER NOT NULL
+    flags INTEGER NOT NULL,
+    lod_origin_x INTEGER,               -- Validated sidecar/explicit origin; NULL if unresolved
+    lod_origin_y INTEGER
 );
 ```
 
@@ -122,12 +125,22 @@ CREATE TABLE IF NOT EXISTS references (
     rot_z REAL NOT NULL,                -- Rotation Z (Radians)
     scale REAL NOT NULL DEFAULT 1.0,    -- Scale multiplier
     radius_override REAL,               -- XRDS radius in Creation units (NULL when the REFR has none)
+    header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, uninterpreted
+    enable_parent_id INTEGER,           -- Remapped XESP parent FormID; NULL when absent
+    enable_parent_flags INTEGER,        -- XESP flags; NULL when absent
     data BLOB                           -- Subrecords payload
 );
 
 -- Index for O(1) interior cell reference loading
 CREATE INDEX IF NOT EXISTS idx_references_cell_id ON references(cell_id);
 ```
+
+The reference flag and enable-parent columns preserve winning raw-record
+metadata for later object LOD (#106). Current terrain LOD does not consume
+them. `header_flags` comes from the record header; `enable_parent_id` and
+`enable_parent_flags` are the two little-endian words of the eight-byte XESP
+subrecord, with the parent FormID resolved through plugin load order. The raw
+subrecord payload remains in `data`.
 
 ---
 
@@ -167,18 +180,35 @@ CREATE TABLE IF NOT EXISTS land (
 
 ---
 
-### 8. Mesh Level of Detail (`lod`)
+### 8. Level of Detail (`lod_chunks`, `lod_chunks_spatial`, `lod_build`)
 
-Stores terrain and mesh Level of Detail (LOD) geometry chunks.
+Schema 5 stores spatial metadata and file-backed GLB payloads, not geometry
+blobs. Source-cell names are serialized text used for full-detail handoff.
+Bounds are world-space Creation units; `payload_path` is relative to the asset
+root and `content_hash` is the payload's SHA-256. The single build row matches
+`lod-manifest.json`.
 
 ```sql
-CREATE TABLE IF NOT EXISTS lod (
-    cell_id INTEGER NOT NULL,
-    lod_level INTEGER NOT NULL,         -- LOD Level (4, 8, 16, 32)
-    mesh_data BLOB NOT NULL,            -- Pre-cooked LOD geometry mesh
-    PRIMARY KEY (cell_id, lod_level)
+CREATE TABLE IF NOT EXISTS lod_chunks (
+    worldspace_id INTEGER NOT NULL, tier INTEGER NOT NULL,
+    anchor_x INTEGER NOT NULL, anchor_y INTEGER NOT NULL,
+    payload_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+    bounds_min_x REAL NOT NULL, bounds_min_y REAL NOT NULL, bounds_min_z REAL NOT NULL,
+    bounds_max_x REAL NOT NULL, bounds_max_y REAL NOT NULL, bounds_max_z REAL NOT NULL,
+    source_cells TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (worldspace_id, tier, anchor_x, anchor_y)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS lod_chunks_spatial USING rtree(
+    id, minX, maxX, minY, maxY, +worldspace_id, +tier, +anchor_x, +anchor_y
+);
+CREATE TABLE IF NOT EXISTS lod_build (
+    id INTEGER PRIMARY KEY CHECK (id = 1), build_identity TEXT NOT NULL
 );
 ```
+
+The unused pre-schema-5 `lod` blob placeholder is retained. Terrain LOD
+uses `lod_chunks` for indexing and external GLB files for payloads. See
+[ADR-0010](../../adr/0010-lod-chunk-payload-format.md).
 
 ---
 

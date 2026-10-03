@@ -247,9 +247,7 @@ pub fn drain_run_messages(
                 transition(&mut state, &mut effects, Input::Progress);
             }
             RunMessage::Finished(report) => {
-                status.stop_clock();
-                status.push_notice(&report.headline());
-                status.push_notice(&report.artifacts_line());
+                status.finish_run(&report.lines());
                 transition(&mut state, &mut effects, Input::Finished(report));
             }
             RunMessage::Failed(failure) => {
@@ -392,6 +390,7 @@ pub fn output_is_complete(output: &Path) -> bool {
         })
         .is_some_and(|manifest| {
             manifest.complete
+                && manifest.failures.is_empty()
                 && (shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION
                     ..=converter::cache::CONVERTER_SCHEMA_VERSION)
                     .contains(&manifest.schema_version)
@@ -795,6 +794,8 @@ pub(crate) mod tests {
             cache_hits: 3,
             skipped: 0,
             warnings: Vec::new(),
+            lod_chunks: 1693,
+            lod_warnings: (0..12).map(|i| format!("Skipped world {i}")).collect(),
             artifacts: 15,
             elapsed: Duration::from_secs(754),
         };
@@ -812,6 +813,15 @@ pub(crate) mod tests {
             "{:?}",
             status.notice_text()
         );
+        assert!(
+            status
+                .notice_text()
+                .contains("Terrain LOD: 1693 chunks; 12 worldspace warning(s).")
+        );
+        assert!(status.notice_text().contains("LOD: Skipped world 0"));
+        assert!(status.notice_text().contains("LOD: Skipped world 11"));
+        assert_eq!(status.notices.len(), 15);
+        assert!(status.run_finished);
     }
 
     /// The folders a run needs: a Data folder with a `Skyrim.esm` in it, and an output that is set.
@@ -1038,6 +1048,36 @@ pub(crate) mod tests {
 
         std::fs::remove_dir_all(&output).unwrap();
         std::fs::remove_dir_all(&tiny).unwrap();
+    }
+
+    #[test]
+    fn readiness_accepts_the_same_schema_ranges_as_the_runtime() {
+        let output = complete_output("lod-schema-range");
+        for converter_schema in [14, 15, 16, 17, 18] {
+            for world_schema in [2, 3, 4, 5, 6] {
+                std::fs::write(
+                    output.join(MANIFEST_FILE),
+                    format!(
+                        r#"{{"schema_version":{converter_schema},"complete":true,"entries":{{}}}}"#
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    output.join("integration-report.json"),
+                    format!(r#"{{"schema_version":{world_schema},"passed":true}}"#),
+                )
+                .unwrap();
+                assert_eq!(
+                    output_is_complete(&output),
+                    (shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION
+                        ..=converter::cache::CONVERTER_SCHEMA_VERSION)
+                        .contains(&converter_schema)
+                        && shared::supports_runtime_world_database_schema(world_schema),
+                    "converter {converter_schema}, world {world_schema}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(output).unwrap();
     }
 
     /// The output is looked at on the first frame and again when the Output folder changes, never

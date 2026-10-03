@@ -8,6 +8,7 @@ use converter::esm::{
     exporter::{create_tables, export_to_db, validate_database},
     records::RawRecord,
 };
+use converter::shared;
 use dummy_content::{
     esm::{self, Plugin},
     layout,
@@ -363,8 +364,9 @@ fn generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override()
         })
         .unwrap();
     assert_eq!(
-        version, 4,
-        "the lights table and the radius_override column are schema 4"
+        version,
+        shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "the export stamps the contract version the engine checks"
     );
     // The exporter's stamp and the contract the engine checks are one version.
     validate_database(&connection).unwrap();
@@ -403,4 +405,49 @@ fn a_light_without_a_model_exports_a_lights_row_and_no_statics_row() {
         .query_row("SELECT count(*) FROM statics", [], |row| row.get(0))
         .unwrap();
     assert_eq!(all_statics, 1, "only the fixture's own STAT is in statics");
+}
+
+/// The reference's enable state lands in normalized columns, not just the
+/// blob: the header flag word, and the `XESP` parent plus inversion flags.
+/// LOD eligibility (Phase 2) and the dynamic-proxy route (Phase 4) read
+/// these columns without parsing a blob per query.
+#[test]
+fn reference_enable_state_exports_to_normalized_columns() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("Skyrim.esm");
+    // Initially disabled, following parent 0x1234 with inversion set.
+    let stateful = esm::Light {
+        reference_flags: 0x800,
+        enable_parent: Some((0x1234, 0x1)),
+        ..esm::PRESET_LIGHT
+    };
+    fs::write(&path, esm::plugin_with_lights(&spec(), &stateful).unwrap()).unwrap();
+    let records = parse_plugin_file(&path).unwrap();
+    let connection = export_to_database(records);
+    let (header_flags, parent, parent_flags): (u32, Option<u32>, Option<u32>) = connection
+        .query_row(
+            "SELECT header_flags, enable_parent_id, enable_parent_flags FROM \"references\" \
+             WHERE id = (SELECT id FROM \"references\" WHERE header_flags = 0x800)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_flags, 0x800, "the initially-disabled bit survives");
+    assert_eq!(parent, Some(0x1234), "the XESP parent FormID survives");
+    assert_eq!(parent_flags, Some(0x1), "the XESP inversion flag survives");
+
+    // The default preset stays unconditionally enabled: zero flags, no parent.
+    let connection =
+        export_to_database(parse_plugin_file(&write_plugin(directory.path())).unwrap());
+    let (header_flags, parent, parent_flags): (u32, Option<u32>, Option<u32>) = connection
+        .query_row(
+            "SELECT header_flags, enable_parent_id, enable_parent_flags FROM \"references\" \
+             WHERE radius_override IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(header_flags, 0);
+    assert_eq!(parent, None);
+    assert_eq!(parent_flags, None);
 }

@@ -128,6 +128,55 @@ unsafe extern "C" {
 pub struct TextureConverter;
 
 impl TextureConverter {
+    pub(crate) fn encode_rgba_mips(
+        width: u32,
+        height: u32,
+        mip_rgba: &[Vec<u8>],
+        encoding: TextureEncoding,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            width > 0 && height > 0,
+            "texture dimensions must be non-zero"
+        );
+        ensure!(!mip_rgba.is_empty(), "RGBA mip chain is empty");
+        let max_levels = u32::BITS - width.max(height).leading_zeros();
+        ensure!(
+            mip_rgba.len() <= max_levels as usize,
+            "RGBA mip chain has more than {max_levels} levels"
+        );
+
+        let mut encoded_levels = Vec::with_capacity(mip_rgba.len());
+        for (mip, rgba) in mip_rgba.iter().enumerate() {
+            let mip_width = (width >> mip).max(1);
+            let mip_height = (height >> mip).max(1);
+            ensure!(
+                rgba.len() == mip_width as usize * mip_height as usize * 4,
+                "RGBA mip {mip} has an invalid byte length"
+            );
+            encoded_levels.push(encode_basis_ktx2(
+                mip_width,
+                mip_height,
+                rgba,
+                encoding,
+                false,
+                ETC1S_QUALITY_DEFAULT,
+                UASTC_LEVEL_DEFAULT,
+            )?);
+        }
+        let template = encode_basis_ktx2(
+            width,
+            height,
+            &mip_rgba[0],
+            encoding,
+            true,
+            ETC1S_QUALITY_DEFAULT,
+            UASTC_LEVEL_DEFAULT,
+        )?;
+        let bytes = combine_ktx2_mip_levels(&template, &encoded_levels)?;
+        validate_ktx2(&bytes, encoding)?;
+        Ok(bytes)
+    }
+
     pub fn convert_dds_to_ktx2(
         input: &Path,
         output: &Path,
@@ -1538,6 +1587,24 @@ mod tests {
         assert_eq!(metadata.encoded_bytes, bytes.len() as u64);
         assert_eq!(metadata.sha256, crate::cache::hash_bytes(&bytes));
         assert!(!metadata.format.is_empty() && !metadata.supercompression.is_empty());
+    }
+
+    #[test]
+    fn encodes_an_explicit_partial_srgb_mip_chain() {
+        let levels = vec![
+            [96, 48, 24, 255].repeat(64),
+            [96, 48, 24, 255].repeat(16),
+            [96, 48, 24, 255].repeat(4),
+        ];
+        let bytes =
+            TextureConverter::encode_rgba_mips(8, 8, &levels, TextureEncoding::ColorSrgb).unwrap();
+        let reader = ktx2::Reader::new(&bytes).unwrap();
+        assert_eq!(reader.header().level_count, 3);
+        assert_eq!(reader.levels().count(), 3);
+        assert_eq!(
+            reader.transfer_function(),
+            Some(ktx2::TransferFunction::SRGB)
+        );
     }
 
     #[test]

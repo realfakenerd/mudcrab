@@ -1,11 +1,13 @@
 //! Stable data contracts shared by the offline converter and the runtime.
 
+pub mod asset_lock;
 pub mod collision;
 pub mod coordinates;
+pub mod lod;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 4;
+pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 5;
 
 /// The oldest world database schema the runtime (the engine and `world-inspect`) still reads, and
 /// so the oldest the launcher calls ready. Schema 4 only added tables and columns (`lights`,

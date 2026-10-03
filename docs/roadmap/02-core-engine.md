@@ -67,6 +67,8 @@ cargo run -p engine -- --assets modern_assets
 ```
 
 Useful runtime options include `--worldspace`, `--grid-x`, `--grid-y`, and `--stream-radius`.
+`--ini <path>` reads Skyrim-format INI files for `uGridsToLoad` and the terrain LOD distances; see
+[LOD distance configuration](../specs/engine/lod-architecture.md#distance-configuration-skyrim-ini-parity).
 
 The asset-independent renderer benchmark is:
 

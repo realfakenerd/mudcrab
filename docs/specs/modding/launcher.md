@@ -150,15 +150,19 @@ offered for **Resume** (see below).
 
 ### What the panel shows
 
+Conversion includes terrain LOD before final validation and publication. The
+completion result reports generated chunk count and worldspace warnings; a
+complete conversion does not imply LOD coverage for every worldspace.
+
 | | |
 | :--- | :--- |
 | **Skyrim Data** | Where the game's assets are. Filled at start-up by game detection, or set by dropping a folder. A folder with a `Skyrim.esm` in it, case-insensitively, is a `Data` folder; dropping an installation root uses its `Data` subfolder. **Detect** looks again. |
 | **Output** | Where the converted tree is written, and what the engine is started on. Defaults to `modern_assets`, which is what the engine's `--assets` expects. Drop another folder to change it: an empty one or an earlier conversion (see "The Output folder is replaced"). The default may not exist yet; the first conversion creates it. |
 | **Bar** | Whole-run completion, from the same `converter::ProgressEstimate` the command line's status line prints, so it never moves backwards even when a stage finishes short of its total. |
-| **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. |
-| **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. |
+| **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. Terrain LOD shows processed/total worldspaces, including skipped worlds, without asset-rate estimates. |
+| **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. Terrain LOD shows elapsed time only; its timing is not calibrated. |
 | **Asset line** | The asset in flight. |
-| **Notice pane** | Warnings the run emits about single assets, the summary or the error when a run ends, a check's result, and what the launcher itself has to say (the output is ready, the engine started). It keeps the last five lines, except that a check's result is shown whole. It scrolls with the mouse wheel; new notices scroll it to the end, a check's result to its first line. |
+| **Notice pane** | Active notices keep the last five lines. Completed conversion and check results retain all lines and scroll to the summary at the top; conversion results include terrain chunk count and full LOD warnings. Mouse-wheel scrolling reads the rest. A later live notice returns to the five-line view and scrolls to its newest line. |
 | **Play row** | Why Play is or is not available, and the Play button. |
 
 Clicking a disabled button does nothing: the missing `Skyrim.esm` or the empty output is reported in

@@ -1,5 +1,59 @@
+use crate::{skyrim_ini::SkyrimIni, world::components::CELL_SIZE};
 use bevy::prelude::Resource;
+use shared::lod::LodTier;
 use std::{fmt, path::PathBuf};
+
+/// How far each terrain LOD tier draws, in Skyrim's `[TerrainManager]` terms:
+/// a tier reaches its block distance times `fSplitDistanceMult`, in Creation
+/// units from the camera. `--ini` reads these from a `SkyrimPrefs.ini`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainLodDistances {
+    /// `fBlockLevel0Distance`: level-4 tier.
+    pub block_level0_distance: f32,
+    /// `fBlockLevel1Distance`: level-8 tier.
+    pub block_level1_distance: f32,
+    /// `fBlockMaximumDistance`: level-16 tier.
+    pub block_maximum_distance: f32,
+    /// `fSplitDistanceMult`: terrain multiplier on the three block distances.
+    pub split_distance_mult: f32,
+}
+
+impl Default for TerrainLodDistances {
+    /// Skyrim Special Edition's `SkyrimPrefs.ini` defaults, so an install without
+    /// an INI draws as far as the game does: about 12, 25 and 91 cells for
+    /// tiers 4, 8 and 16.
+    fn default() -> Self {
+        Self {
+            block_level0_distance: 35_000.0,
+            block_level1_distance: 70_000.0,
+            block_maximum_distance: 250_000.0,
+            split_distance_mult: 1.5,
+        }
+    }
+}
+
+impl TerrainLodDistances {
+    /// The Chebyshev cell distance from the camera's cell out to which `tier` draws.
+    pub fn reach_cells(&self, tier: LodTier) -> i32 {
+        let block = match tier {
+            LodTier::Tier4 => self.block_level0_distance,
+            LodTier::Tier8 => self.block_level1_distance,
+            LodTier::Tier16 => self.block_maximum_distance,
+        };
+        // `as` saturates, so an enormous configured distance means "everything".
+        (f64::from(block) * f64::from(self.split_distance_mult) / f64::from(CELL_SIZE)).floor()
+            as i32
+    }
+
+    /// The farthest reach of any tier.
+    pub fn max_reach_cells(&self) -> i32 {
+        LodTier::ALL
+            .map(|tier| self.reach_cells(tier))
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    }
+}
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
@@ -8,6 +62,7 @@ pub struct EngineConfig {
     pub start_grid: (i32, i32),
     pub stream_radius: i32,
     pub unload_radius: i32,
+    pub terrain_lod: TerrainLodDistances,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
     /// Cells outside the unload radius a frame may despawn. `0` despawns every one at once, which
@@ -70,8 +125,10 @@ impl Default for EngineConfig {
             assets_dir: PathBuf::from("modern_assets"),
             worldspace_id: 0x3c,
             start_grid: (0, 0),
+            // Skyrim's default `uGridsToLoad=5`.
             stream_radius: 2,
             unload_radius: 3,
+            terrain_lod: TerrainLodDistances::default(),
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
             max_cell_unloads_per_frame: 2,
@@ -146,6 +203,7 @@ Assets and start position:
   --lights                              place a point light for each streamed LIGH reference
 
 Streaming:
+  --ini <file>                        layer Skyrim INI settings; CLI options override files
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
   --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
@@ -368,6 +426,20 @@ impl EngineConfig {
             return Ok(ConfigAction::Help);
         }
         let mut config = Self::default();
+        let mut ini = SkyrimIni::default();
+        for pair in args.windows(2) {
+            if pair[0] == "--ini" {
+                let path = PathBuf::from(take_raw(
+                    "--ini",
+                    "a Skyrim INI file path",
+                    Some(pair[1].clone()),
+                )?);
+                if let Err(error) = ini.merge_file(&path) {
+                    eprintln!("warning: ignoring --ini {}: {error}", path.display());
+                }
+            }
+        }
+        ini.apply(&mut config);
         let mut args = args.into_iter().peekable();
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -379,6 +451,9 @@ impl EngineConfig {
                 // engine takes no positional arguments, so it has nothing to
                 // end, and main ignored it: keep ignoring it.
                 "--" => {}
+                "--ini" => {
+                    take_raw("--ini", "a Skyrim INI file path", args.next())?;
+                }
                 "--assets" => {
                     config.assets_dir = take_value(
                         "--assets",
@@ -797,29 +872,38 @@ mod tests {
     /// scripts goes to the engine. None of the audit tools starts the engine,
     /// so their own options must not be mistaken for engine options.
     const NON_ENGINE_FLAGS: &[&str] = &[
-        "--all",               // cargo fmt
-        "--all-targets",       // cargo test, cargo clippy
-        "--bin",               // cargo test
-        "--bins",              // cargo build
-        "--check",             // cargo fmt
-        "--release",           // cargo build
-        "--workspace",         // cargo build, cargo test, cargo clippy
-        "--ignore-submodules", // git diff
-        "--quiet",             // git diff
-        "--short",             // git rev-parse
-        "--output",            // world-inspect
-        "--radius",            // world-inspect
-        "--library-path",      // ld-linux
-        "--meshes",            // audit-collision.py
-        "--min-x",             // audit-collision.py
-        "--max-x",             // audit-collision.py
-        "--min-y",             // audit-collision.py
-        "--max-y",             // audit-collision.py
-        "--out",               // audit-collision.py
-        "--expect-solid",      // audit-collision.py
-        "--expect-passable",   // audit-collision.py
-        "--original",          // audit_asset_sizes.py
-        "--json",              // audit_asset_sizes.py
+        "--all",                 // cargo fmt
+        "--all-targets",         // cargo test, cargo clippy
+        "--bin",                 // cargo test
+        "--bins",                // cargo build
+        "--check",               // cargo fmt
+        "--release",             // cargo build
+        "--workspace",           // cargo build, cargo test, cargo clippy
+        "--ignore-submodules",   // git diff
+        "--quiet",               // git diff
+        "--short",               // git rev-parse
+        "--output",              // world-inspect
+        "--radius",              // world-inspect
+        "--library-path",        // ld-linux
+        "--meshes",              // audit-collision.py
+        "--min-x",               // audit-collision.py
+        "--max-x",               // audit-collision.py
+        "--min-y",               // audit-collision.py
+        "--max-y",               // audit-collision.py
+        "--out",                 // audit-collision.py
+        "--expect-solid",        // audit-collision.py
+        "--expect-passable",     // audit-collision.py
+        "--original",            // audit_asset_sizes.py
+        "--json",                // audit_asset_sizes.py
+        "--candidate-inventory", // audit-riverwood-reuse.py
+        "--reference-inventory", // audit-riverwood-reuse.py
+        "--manifest",            // audit-riverwood-reuse.py
+        "--locked",              // cargo run
+        "--manifest-path",       // cargo run
+        "--cpu-jobs",            // converter
+        "--io-jobs",             // converter
+        "--binary",              // git diff
+        "--porcelain",           // git status
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1114,6 +1198,37 @@ mod tests {
         assert!(config.physics_fixture);
     }
 
+    /// `--ini` files layer in order and every other option overrides them,
+    /// wherever it appears on the command line.
+    #[test]
+    fn ini_files_apply_in_order_and_command_line_options_override_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let skyrim = directory.path().join("Skyrim.ini");
+        let prefs = directory.path().join("SkyrimPrefs.ini");
+        std::fs::write(&skyrim, "[General]\nuGridsToLoad=7\n").unwrap();
+        std::fs::write(
+            &prefs,
+            "[General]\nuGridsToLoad=9\n[TerrainManager]\nfSplitDistanceMult=1.5\n",
+        )
+        .unwrap();
+        let path = |path: &std::path::Path| path.display().to_string();
+        let layered = run_config(&["--ini", &path(&skyrim), "--ini", &path(&prefs)]);
+        assert_eq!((layered.stream_radius, layered.unload_radius), (4, 5));
+        assert_eq!(layered.terrain_lod.split_distance_mult, 1.5);
+
+        let overridden = run_config(&["--stream-radius", "1", "--ini", &path(&prefs)]);
+        assert_eq!((overridden.stream_radius, overridden.unload_radius), (1, 2));
+        assert_eq!(overridden.terrain_lod.split_distance_mult, 1.5);
+
+        let missing = run_config(&[
+            "--ini",
+            &path(&directory.path().join("absent.ini")),
+            "--headless",
+        ]);
+        assert!(missing.headless, "a missing file is reported and skipped");
+        assert_eq!(missing.terrain_lod, TerrainLodDistances::default());
+    }
+
     /// Lights are opt-in: the flag is off unless it is given, so the default run - and every
     /// acceptance or benchmark baseline taken from one - is unchanged.
     #[test]
@@ -1240,6 +1355,23 @@ mod tests {
             parse_error(&["riverwood"]).to_string(),
             "unexpected argument 'riverwood'. Run with --help to list every option."
         );
+    }
+
+    #[test]
+    fn ini_v88_refuses_missing_or_option_shaped_paths() {
+        for args in [&["--ini"][..], &["--ini", "--headless"]] {
+            assert!(matches!(
+                parse_error(args),
+                ConfigError::InvalidValue {
+                    option: "--ini",
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            EngineConfig::from_args(["--ini".into(), "--help".into()]),
+            Ok(ConfigAction::Help)
+        ));
     }
 
     #[test]
@@ -1495,8 +1627,8 @@ mod tests {
         scripts.is_dir().then_some(scripts)
     }
 
-    /// Every `.ps1`, `.sh` and `.py` file under `root`, subdirectories included,
-    /// in a stable order.
+    /// Utility `.ps1`, `.sh` and `.py` files under `root`, subdirectories included,
+    /// in a stable order. Hidden directories and script tests are excluded.
     fn script_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         let mut pending = vec![root.to_owned()];
@@ -1509,7 +1641,10 @@ mod tests {
                 // `file_type` does not follow links, so a linked folder cannot
                 // loop the walk; hidden folders (`.venv`) hold no project scripts.
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    if !entry.file_name().to_string_lossy().starts_with('.') {
+                    let name = entry.file_name();
+                    // Tests inspect script text, including deliberately unsupported engine
+                    // options; they are not utility command lines.
+                    if !name.to_string_lossy().starts_with('.') && name != "tests" {
                         pending.push(path);
                     }
                 } else if matches!(
@@ -1524,7 +1659,7 @@ mod tests {
         paths
     }
 
-    /// Every `.ps1`, `.sh` and `.py` file in `scripts/`, subdirectories
+    /// Every utility `.ps1`, `.sh` and `.py` file in `scripts/`, subdirectories
     /// included, is read from disk, so a script added later cannot pass an
     /// option the parser refuses without failing this test. The scan is skipped
     /// when the repository's `scripts/` is not next to this crate.
@@ -1618,12 +1753,35 @@ mod tests {
                 character.is_whitespace()
                     || matches!(
                         character,
-                        '"' | '\'' | '(' | ')' | ',' | ';' | '=' | '[' | ']' | '`'
+                        '"' | '\'' | '(' | ')' | ';' | '=' | '[' | ']' | '`'
                     )
             })
+            // Commas at the edges delimit PowerShell lists. Internal commas belong
+            // to a CSV value such as a camera offset and must stay together.
+            .map(|token| token.trim_matches(','))
             .filter(|token| !token.is_empty())
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn script_v89_token_scan_preserves_csv_values_and_list_delimiters() {
+        assert_eq!(
+            script_tokens(r#"--screenshot-camera-offset "0,6000,8000""#),
+            ["--screenshot-camera-offset", "0,6000,8000"]
+        );
+        assert_eq!(script_tokens("('--grid-x',5)"), ["--grid-x", "5"]);
+    }
+
+    #[test]
+    fn script_v89_scan_excludes_tests_and_keeps_nested_utilities() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("tests")).unwrap();
+        std::fs::create_dir(directory.path().join("utils")).unwrap();
+        std::fs::write(directory.path().join("tests/check.py"), "--log-file").unwrap();
+        let utility = directory.path().join("utils/capture.sh");
+        std::fs::write(&utility, "--headless").unwrap();
+        assert_eq!(script_paths(directory.path()), vec![utility]);
     }
 
     /// True when a script spells out a finite number.

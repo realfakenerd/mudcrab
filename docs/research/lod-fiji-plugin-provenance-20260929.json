@@ -1,0 +1,412 @@
+{
+  "verified_at_utc": "2026-09-30T01:37:38.905Z",
+  "source_data_dir": "/home/dev/skyrim/Skyrim Special Edition/Data",
+  "package_host": "taylor@100.85.85.120",
+  "package_database": "/home/taylor/riverwood-pkg-textures-20260928/assets/skyrim_world.db",
+  "query": "SELECT name,priority,lower(hex(checksum)) AS checksum FROM plugins ORDER BY priority,id",
+  "algorithm": "SHA-256",
+  "checked": 80,
+  "matched": 80,
+  "plugins": [
+    {
+      "name": "Skyrim.esm",
+      "priority": 0,
+      "checksum": "e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73"
+    },
+    {
+      "name": "Update.esm",
+      "priority": 1,
+      "checksum": "b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280"
+    },
+    {
+      "name": "Dawnguard.esm",
+      "priority": 2,
+      "checksum": "fc8f92cb7ed55217046ee96b84caa54c058c12f7c408ac2a71da880a7bd3eab7"
+    },
+    {
+      "name": "HearthFires.esm",
+      "priority": 3,
+      "checksum": "0f681496771e6d1983c6c1c9dd6602964068837f015bfa21e69a149c3b050047"
+    },
+    {
+      "name": "Dragonborn.esm",
+      "priority": 4,
+      "checksum": "635f21a938a17b8677f524cf41210933afc7f23820f2e210ab3bb6d3cd837046"
+    },
+    {
+      "name": "_ResourcePack.esl",
+      "priority": 5,
+      "checksum": "3479f3aa9002e28d206a1e7366d613e52d7ba93fc6b96c207a1fcf89051a67db"
+    },
+    {
+      "name": "ccafdsse001-dwesanctuary.esm",
+      "priority": 6,
+      "checksum": "9cfefe347a7b5b9867ef5c7e0e50de2660442f9669e9a6a6bfd61a61b3a2dd83"
+    },
+    {
+      "name": "ccasvsse001-almsivi.esm",
+      "priority": 7,
+      "checksum": "4f8a43fe99a305a1ae7f9a3a8ecdbf63e62f2f70779dcf5cea1e579131bfddd6"
+    },
+    {
+      "name": "ccbgssse001-fish.esm",
+      "priority": 8,
+      "checksum": "0036c3bb38754d1681529f6f828987506efbecc97fe6008753ac05e7c6738fff"
+    },
+    {
+      "name": "ccbgssse002-exoticarrows.esl",
+      "priority": 9,
+      "checksum": "be6202927255114b403dd1df6ab7f3cb85bf35e4c9add0a21cda9d387b716be4"
+    },
+    {
+      "name": "ccbgssse003-zombies.esl",
+      "priority": 10,
+      "checksum": "46835eb4607b8a63355ed7647ec70d65adcac86cef991f00cab788a727b533f6"
+    },
+    {
+      "name": "ccbgssse004-ruinsedge.esl",
+      "priority": 11,
+      "checksum": "3fe31d2d8cd9d9492e92894f9bff3ddf5a03494e33d815cfcdcf51769dc02933"
+    },
+    {
+      "name": "ccbgssse005-goldbrand.esl",
+      "priority": 12,
+      "checksum": "0d3dbe1c03d60c3d3dbd0f2a5def05f8052daf175b9c4b9661d1e3ec9546a257"
+    },
+    {
+      "name": "ccbgssse006-stendarshammer.esl",
+      "priority": 13,
+      "checksum": "b04f468adb59abf6bd9c40a8b18a947377aa3ef519fb2e8667975ee45541917d"
+    },
+    {
+      "name": "ccbgssse007-chrysamere.esl",
+      "priority": 14,
+      "checksum": "97f6238ffdae7f320a163b69c750a19e25f4218ec4e5993d4bc4131e6a3f0bbe"
+    },
+    {
+      "name": "ccbgssse008-wraithguard.esl",
+      "priority": 15,
+      "checksum": "dbb3fe0f68e32a2920661121b448971b22859c8ab676f2f63f5b45dc1464c57a"
+    },
+    {
+      "name": "ccbgssse010-petdwarvenarmoredmudcrab.esl",
+      "priority": 16,
+      "checksum": "1207ba28ac45ad379d2ab0f4b8bb14693917fd92630ca973c0eccb287159df14"
+    },
+    {
+      "name": "ccbgssse011-hrsarmrelvn.esl",
+      "priority": 17,
+      "checksum": "812f58daa05852e057db5e63b13ed6b526e63e055644659321a521d0b77f86b8"
+    },
+    {
+      "name": "ccbgssse012-hrsarmrstl.esl",
+      "priority": 18,
+      "checksum": "7667c5506fc5856d7e7b756e003f121cffc7fcd8cc89af2549435b35da6c8ab1"
+    },
+    {
+      "name": "ccbgssse013-dawnfang.esl",
+      "priority": 19,
+      "checksum": "3f6456a23c8aa5a2a6a62d7d9ff8ca7ec71c528789b67d4f36c7bd0ce4e19f5a"
+    },
+    {
+      "name": "ccbgssse014-spellpack01.esl",
+      "priority": 20,
+      "checksum": "e0816d2b6b8fc9303fa6343ad8acfad8f80fbc519d9dfc01b560706b539af486"
+    },
+    {
+      "name": "ccbgssse016-umbra.esm",
+      "priority": 21,
+      "checksum": "4b33a4d16461786edca6f54beeaf32c6ca2bc0d8b07529e268352dc5bffd2164"
+    },
+    {
+      "name": "ccbgssse018-shadowrend.esl",
+      "priority": 22,
+      "checksum": "7ffcdfd2882445f25db3c5b4d40de7efa28dcca03d8eceb7a3e155e3c6618cfc"
+    },
+    {
+      "name": "ccbgssse019-staffofsheogorath.esl",
+      "priority": 23,
+      "checksum": "3b210b998139c10e0cf0c21d19628877ab4780c3146a66e0fe887fd6f42d5c88"
+    },
+    {
+      "name": "ccbgssse020-graycowl.esl",
+      "priority": 24,
+      "checksum": "97668c48af7219009bc708ce252c46de51112a407b7850adfa35242597a9e31d"
+    },
+    {
+      "name": "ccbgssse021-lordsmail.esl",
+      "priority": 25,
+      "checksum": "3b018358b456a170e557338811de30b7aab9435e42c8aa37c859f875f01ce921"
+    },
+    {
+      "name": "ccbgssse025-advdsgs.esm",
+      "priority": 26,
+      "checksum": "070784062525ac872b98503cf60918bcd7e7b8aede7fcedd86839a57467add5b"
+    },
+    {
+      "name": "ccbgssse031-advcyrus.esm",
+      "priority": 27,
+      "checksum": "4159b3763be26dc441013d9fb1e07657481584c1f444d2692c4fe76fa2ba980a"
+    },
+    {
+      "name": "ccbgssse034-mntuni.esl",
+      "priority": 28,
+      "checksum": "d8c2f05920e70e8fbeb1800cab39c28d5717b5db82a55ffc9ca327e89cd5e5ee"
+    },
+    {
+      "name": "ccbgssse035-petnhound.esl",
+      "priority": 29,
+      "checksum": "9c6763048559dbcdc50184ce8cac1d1b3eb3d4aa07c7b5008457662098af0267"
+    },
+    {
+      "name": "ccbgssse036-petbwolf.esl",
+      "priority": 30,
+      "checksum": "5630ca51269e841b076a3e3ef91b4098370c8c586ac8a3000c77632d3f0d0bd7"
+    },
+    {
+      "name": "ccbgssse037-curios.esl",
+      "priority": 31,
+      "checksum": "f5a970ada5cf32f3088f01bccdad0a6be69a5b43e5e325ad4cbd7c6d1a15f4d3"
+    },
+    {
+      "name": "ccbgssse038-bowofshadows.esl",
+      "priority": 32,
+      "checksum": "c04ef30ee2debe7e87999d147d5b282669cadbbe5caea611cba0ad00e9642be8"
+    },
+    {
+      "name": "ccbgssse040-advobgobs.esl",
+      "priority": 33,
+      "checksum": "70803775e0ba731281f8654badf9b5d45a151ffeabb7808d144f81754f03d7da"
+    },
+    {
+      "name": "ccbgssse041-netchleather.esl",
+      "priority": 34,
+      "checksum": "ae2a0f3079cbab21aadccc4763ce9d510138018c4ea177277aafef4628d0e567"
+    },
+    {
+      "name": "ccbgssse043-crosselv.esl",
+      "priority": 35,
+      "checksum": "fbc20fea84add0b2a3d11a4476a03e2c3aaf16935bc9092ea1ef7df63472c1ca"
+    },
+    {
+      "name": "ccbgssse045-hasedoki.esl",
+      "priority": 36,
+      "checksum": "fae74f32a956ab9eb628a93f48cf091e22022afdce3f84be240149a2a30e4bd3"
+    },
+    {
+      "name": "ccbgssse050-ba_daedric.esl",
+      "priority": 37,
+      "checksum": "3d4b1a048a1fb86a3366cf592d44a667482db7b51f86fec8be56c33b43b27ad8"
+    },
+    {
+      "name": "ccbgssse051-ba_daedricmail.esl",
+      "priority": 38,
+      "checksum": "fe4d2b95cbd50d1d48a8bd9133d0b69e374519811954f312206bb93b0fc5893c"
+    },
+    {
+      "name": "ccbgssse052-ba_iron.esl",
+      "priority": 39,
+      "checksum": "0cef545548268b9f09d041ca8cbc63c38cfe361a754cb08131214eee3efa9f2f"
+    },
+    {
+      "name": "ccbgssse053-ba_leather.esl",
+      "priority": 40,
+      "checksum": "a2ddd7d20ec9e62d8f6703c5d0630bdafe621f78f160913bf093ef70bb4b7f70"
+    },
+    {
+      "name": "ccbgssse054-ba_orcish.esl",
+      "priority": 41,
+      "checksum": "0748cf5dcc522d8ed093934dabc5e197e770a693cc0819373d76c9b7fe2e8cb5"
+    },
+    {
+      "name": "ccbgssse055-ba_orcishscaled.esl",
+      "priority": 42,
+      "checksum": "108d436999461d759d5d40bd256ebf1e5ce0ddb5987259842c36263f63c67864"
+    },
+    {
+      "name": "ccbgssse056-ba_silver.esl",
+      "priority": 43,
+      "checksum": "42ac28d0a708a2162fc3dd9884e1dd9009a416b5be9447ff14282e7b3a7a1a5a"
+    },
+    {
+      "name": "ccbgssse057-ba_stalhrim.esl",
+      "priority": 44,
+      "checksum": "eb633ba1390e0e3f3d672fba31cc3307dee579948b346e35a44829744a7c98b2"
+    },
+    {
+      "name": "ccbgssse058-ba_steel.esl",
+      "priority": 45,
+      "checksum": "984359acacc1fa376ac40e7c3778b5db8944015345a349062a0da0ca30631e7d"
+    },
+    {
+      "name": "ccbgssse059-ba_dragonplate.esl",
+      "priority": 46,
+      "checksum": "426493c7264a7d3cff297785b1211dadffecc4167e1abd34a8b2b8c332d0f8ab"
+    },
+    {
+      "name": "ccbgssse060-ba_dragonscale.esl",
+      "priority": 47,
+      "checksum": "99990bf801b45c6e60f46f9ce8f788640cce1cded98e19295266f74d9e760cea"
+    },
+    {
+      "name": "ccbgssse061-ba_dwarven.esl",
+      "priority": 48,
+      "checksum": "1ed7978f5514cfed91d36aa30529493b171ae695d21c5892d4254a775f5c4d5e"
+    },
+    {
+      "name": "ccbgssse062-ba_dwarvenmail.esl",
+      "priority": 49,
+      "checksum": "e2c08d9c6d7863ee10f43c786876ac163cba62b9836763c5ff1e6820abdcc66e"
+    },
+    {
+      "name": "ccbgssse063-ba_ebony.esl",
+      "priority": 50,
+      "checksum": "7eb4502b4e270860ac7a8fa45f678bc03f08335c541b3bf466690f4ed04c0804"
+    },
+    {
+      "name": "ccbgssse064-ba_elven.esl",
+      "priority": 51,
+      "checksum": "3a6b953db5188744e8eb1c166ca3027f5cdc1e27a222051c44d3be2ed7cc1ce5"
+    },
+    {
+      "name": "ccbgssse066-staves.esl",
+      "priority": 52,
+      "checksum": "a09bb9c1c1be60b0bf3c94425d81adc75de7131c145e90e0bbe4fe90e5be4e29"
+    },
+    {
+      "name": "ccbgssse067-daedinv.esm",
+      "priority": 53,
+      "checksum": "80452d196523f08c784234d3f05bc134dc085ce2da012dfcceb08f46ca3cf964"
+    },
+    {
+      "name": "ccbgssse068-bloodfall.esl",
+      "priority": 54,
+      "checksum": "c11a7fc5acfc0223d2d10d4ca10ba86edc17b2797b695b387200e9b5f0203cf7"
+    },
+    {
+      "name": "ccbgssse069-contest.esl",
+      "priority": 55,
+      "checksum": "3d5477334a8cdfa3d19cc0817b3c46c67e0ebb824bd6f493ff01f5b3d2cf6010"
+    },
+    {
+      "name": "cccbhsse001-gaunt.esl",
+      "priority": 56,
+      "checksum": "a1c8b3cd87f334400923af4825d390ed7096090fd961e4bbba87c68c25a4d6dc"
+    },
+    {
+      "name": "ccedhsse001-norjewel.esl",
+      "priority": 57,
+      "checksum": "63eb4851f786c0bab2a3276121f7b3c75a8d83d78ba05067182760627f7afb0a"
+    },
+    {
+      "name": "ccedhsse002-splkntset.esl",
+      "priority": 58,
+      "checksum": "af6694f07df8246628fa8445282eaa4d93d44ea81371969449dff4739295612e"
+    },
+    {
+      "name": "ccedhsse003-redguard.esl",
+      "priority": 59,
+      "checksum": "7cdd253ef4c71b7be60473186483b9ee4054b778ef99cae983151f15bec33029"
+    },
+    {
+      "name": "cceejsse001-hstead.esm",
+      "priority": 60,
+      "checksum": "17754840707fb1899c7de07ed956b2ff02541caa9f6702dee2e8e96adce86fb2"
+    },
+    {
+      "name": "cceejsse002-tower.esl",
+      "priority": 61,
+      "checksum": "7ea314b35b1ae2f1d470486d8cb13598f712901e65adc3b5f7ab5aeccca00910"
+    },
+    {
+      "name": "cceejsse003-hollow.esl",
+      "priority": 62,
+      "checksum": "e93082e766e7894b063cb094118d0d8be94d3878fa52937b86efaecb984c126a"
+    },
+    {
+      "name": "cceejsse004-hall.esl",
+      "priority": 63,
+      "checksum": "248c7c874aa199f3f73e5292c223a03db0a64f2db0bfe872de4511ce9122f177"
+    },
+    {
+      "name": "cceejsse005-cave.esm",
+      "priority": 64,
+      "checksum": "b8fa63c12cc0d1ff088f368b88ac930014b037e3809049a959bbc321cbad18f9"
+    },
+    {
+      "name": "ccffbsse001-imperialdragon.esl",
+      "priority": 65,
+      "checksum": "d8297b04bd660d605a8a63403b865ce2ebfbe9795a8e5e98be27014f7e664f8f"
+    },
+    {
+      "name": "ccffbsse002-crossbowpack.esl",
+      "priority": 66,
+      "checksum": "7582a30a61c87205b00ee5a36d417eb35b26cc2cde30398c6765839a25064faf"
+    },
+    {
+      "name": "ccfsvsse001-backpacks.esl",
+      "priority": 67,
+      "checksum": "ce6a492ff9c69a0900ce43defc94b1faa8e8424533318b63a5914060fd10abab"
+    },
+    {
+      "name": "cckrtsse001_altar.esl",
+      "priority": 68,
+      "checksum": "1f46e579367c0c661b9a8a25ef201f017425dbad29861a6294147f21b25049e1"
+    },
+    {
+      "name": "ccmtysse001-knightsofthenine.esl",
+      "priority": 69,
+      "checksum": "8ca4517aebc66bae2df7cf6d5059c37729dae72e14dfbfdd2072a9a143980fc2"
+    },
+    {
+      "name": "ccmtysse002-ve.esl",
+      "priority": 70,
+      "checksum": "d6e0b38530a41cc6af8a789b5008f40a12186dd37860448814aaa8b65d762ffc"
+    },
+    {
+      "name": "ccpewsse002-armsofchaos.esl",
+      "priority": 71,
+      "checksum": "ef1ef4bc38173e349ec6d3df8ec1e719b807ae10c9c147fa01d48675f8e57c02"
+    },
+    {
+      "name": "ccqdrsse001-survivalmode.esl",
+      "priority": 72,
+      "checksum": "0aeb0734128137f77fed4c2c329fd4ce71a4d043a2093871886ad84e5821ac47"
+    },
+    {
+      "name": "ccqdrsse002-firewood.esl",
+      "priority": 73,
+      "checksum": "4e1b0294195c59c7c7acd4f3278adece6ec4b358f247f51d91983bf713aeac56"
+    },
+    {
+      "name": "ccrmssse001-necrohouse.esl",
+      "priority": 74,
+      "checksum": "aaa19416a23b459a832f9b1cb9dfb377a3d0ee784e5042c6f9e526f48a393b1b"
+    },
+    {
+      "name": "cctwbsse001-puzzledungeon.esm",
+      "priority": 75,
+      "checksum": "8c0c595fd27539463716af1a6009e8554319b150b1dcc647ff0235e461eb0e3b"
+    },
+    {
+      "name": "ccvsvsse001-winter.esl",
+      "priority": 76,
+      "checksum": "13f7d0d3c30a667077191c74432d2ee80049b4483f7a403a5204c07cc8e1b997"
+    },
+    {
+      "name": "ccvsvsse002-pets.esl",
+      "priority": 77,
+      "checksum": "a9150f8c296fe26be3a13a06cd60869828af51357b620401166e6eb00b938dbb"
+    },
+    {
+      "name": "ccvsvsse003-necroarts.esl",
+      "priority": 78,
+      "checksum": "a485b204315ab8b0a3e6805e3de21c5bedb3734c3efd94b1bddc67731a14758f"
+    },
+    {
+      "name": "ccvsvsse004-beafarmer.esl",
+      "priority": 79,
+      "checksum": "3cff6feab109b434d1ec9c85f2ed996fdc73302bf3173388300170ba19b3ff9d"
+    }
+  ]
+}

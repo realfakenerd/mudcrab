@@ -22,12 +22,14 @@ async fn staged_vfs_entries_are_one_file_with_their_cache_blobs() {
             bsa: true,
             ba2: true,
             esm: true,
+            lodsettings: false,
         },
     )
     .unwrap();
 
     let output = directory.path().join("modern");
-    // A stale backup makes publishing refuse, so the run stops with its staging folder kept and
+    std::fs::create_dir_all(&output).unwrap();
+    // A stale backup beside an existing output makes publishing refuse, so staging is kept and
     // the workspace links stay inspectable.
     let backup = output.with_extension(format!("backup-{}", std::process::id()));
     std::fs::create_dir_all(&backup).unwrap();

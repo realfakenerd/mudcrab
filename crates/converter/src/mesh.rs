@@ -27,6 +27,15 @@ use walkdir::WalkDir;
 
 pub struct MeshConverter;
 
+pub(crate) fn nif_source_hash(path: &Path) -> Result<String> {
+    let mut hash = crate::cache::hash_file(path)?;
+    for dependency in MeshConverter::dependency_paths(path) {
+        hash.push(':');
+        hash.push_str(&crate::cache::hash_file(&dependency)?);
+    }
+    Ok(hash)
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NifParseDiagnostics {
     pub block_count: usize,
@@ -281,7 +290,38 @@ fn prune_dangling_uris_in_glb(
 ) -> Result<Option<PrunedGlb>> {
     let bytes =
         fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
-    let mut document = glb_json_from_bytes(&bytes)
+    let Some((pruned, removed_uris)) =
+        prune_glb_texture_bytes_with_sources(root, glb_path, &bytes, source_textures)?
+    else {
+        return Ok(None);
+    };
+    write_glb_atomic(glb_path, &pruned)?;
+    let relative = glb_path
+        .strip_prefix(root)
+        .unwrap_or(glb_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(Some(PrunedGlb {
+        glb: relative,
+        removed_uris,
+    }))
+}
+
+pub(crate) fn prune_glb_texture_bytes(
+    root: &Path,
+    glb_path: &Path,
+    bytes: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+    prune_glb_texture_bytes_with_sources(root, glb_path, bytes, &BTreeSet::new())
+}
+
+fn prune_glb_texture_bytes_with_sources(
+    root: &Path,
+    glb_path: &Path,
+    bytes: &[u8],
+    source_textures: &BTreeSet<String>,
+) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+    let mut document = glb_json_from_bytes(bytes)
         .wrap_err_with(|| format!("failed to inspect textures in {}", glb_path.display()))?;
     let missing: Vec<(usize, String)> = document
         .get("images")
@@ -305,18 +345,12 @@ fn prune_dangling_uris_in_glb(
     }
     let removed: HashSet<usize> = missing.iter().map(|(index, _)| *index).collect();
     prune_document_images(&mut document, &removed);
-    let pruned = rebuild_glb_with_document(&bytes, &document)
+    let pruned = rebuild_glb_with_document(bytes, &document)
         .wrap_err_with(|| format!("failed to rebuild {}", glb_path.display()))?;
-    write_glb_atomic(glb_path, &pruned)?;
-    let relative = glb_path
-        .strip_prefix(root)
-        .unwrap_or(glb_path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    Ok(Some(PrunedGlb {
-        glb: relative,
-        removed_uris: missing.into_iter().map(|(_, uri)| uri).collect(),
-    }))
+    Ok(Some((
+        pruned,
+        missing.into_iter().map(|(_, uri)| uri).collect(),
+    )))
 }
 
 fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
@@ -789,6 +823,7 @@ fn open_nif_resilient(
                 block,
                 NifBlock::NiNode(_)
                     | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSMultiBoundNode(_)
                     | NifBlock::BSTriShape(_)
                     | NifBlock::BSDynamicTriShape(_)
                     | NifBlock::BSSubIndexTriShape(_)
@@ -869,6 +904,7 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         }
         let children = match blocks.get(index) {
             Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => &node.children,
+            Some(NifBlock::BSMultiBoundNode(block)) => &block.node.children,
             _ => return usize::from(index < blocks.len()),
         };
         visiting.push(index);

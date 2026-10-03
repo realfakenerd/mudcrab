@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Which encoder turns DDS textures into UASTC KTX2.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +33,12 @@ pub struct PipelineConfig {
     #[serde(skip)]
     pub cache_dir: Option<PathBuf>,
     pub plugins_file: Option<PathBuf>,
+    /// Explicit per-worldspace LOD origins for custom worlds, keyed by
+    /// worldspace editor id: `[grid_x, grid_y]`. Installed worlds read
+    /// `lodsettings/<WorldspaceEDID>.lod` instead; a world with neither gets
+    /// no LOD, never an assumed origin of zero (GEOM-02).
+    #[serde(default)]
+    pub lod_origins: BTreeMap<String, [i32; 2]>,
     pub cpu_jobs: usize,
     pub io_jobs: usize,
     pub enable_ba2: bool,
@@ -63,6 +72,7 @@ impl PipelineConfig {
             resume_staging: None,
             cache_dir: None,
             plugins_file: None,
+            lod_origins: BTreeMap::new(),
             cpu_jobs: std::thread::available_parallelism().map_or(1, usize::from),
             io_jobs: 2,
             enable_ba2: true,
@@ -331,6 +341,34 @@ fn parent_or_cwd(path: &Path) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_v90_accepts_legacy_configs_without_inventing_lod_origins() {
+        let mut legacy = serde_json::json!({
+            "data_dir": "Data",
+            "output_dir": "modern_assets",
+            "plugins_file": null,
+            "cpu_jobs": 2,
+            "io_jobs": 2,
+            "enable_ba2": true,
+            "fail_fast": false,
+            "invalidate_cache": false,
+            "verify_cache": true,
+            "texture_etc1s_quality": 192,
+            "texture_uastc_level": 2,
+            "texture_zstd_level": 6,
+            "script_abi_version": 1
+        });
+        let config: PipelineConfig = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(config.lod_origins.is_empty());
+        assert_eq!(config.texture_encoder, TextureEncoder::Cpu);
+        assert_eq!(config.data_dir, PathBuf::from("Data"));
+        assert_eq!(config.cpu_jobs, 2);
+
+        legacy["lod_origins"] = serde_json::json!({"GeneratedWorld": [-4, 12]});
+        let explicit: PipelineConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(explicit.lod_origins["GeneratedWorld"], [-4, 12]);
+    }
 
     #[test]
     fn finds_the_newest_staging_folder_beside_the_output() {

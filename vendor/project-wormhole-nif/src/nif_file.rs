@@ -60,6 +60,7 @@ impl NifFile {
             .iter()
             .filter_map(|block| match block {
                 NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => Some(node),
+                NifBlock::BSMultiBoundNode(block) => Some(&block.node),
                 _ => None,
             })
             .collect()
@@ -163,8 +164,10 @@ impl NifFile {
 
     pub fn get_node_ref(&mut self, node_name: &str) -> Result<&mut NiNode, String> {
         if let Some(pos) = self.get_node_pos(node_name) {
-            if let NifBlock::NiNode(node) = &mut self.blocks[pos] {
-                return Ok(node);
+            match &mut self.blocks[pos] {
+                NifBlock::NiNode(node) => return Ok(node),
+                NifBlock::BSMultiBoundNode(block) => return Ok(&mut block.node),
+                _ => {}
             }
         }
         Err("Node not found".to_string())
@@ -172,15 +175,15 @@ impl NifFile {
 
     pub fn get_node_pos(&self, node_name: &str) -> Option<usize> {
         for (index, block) in self.blocks.iter().enumerate() {
-            match block {
-                NifBlock::NiNode(node) => {
-                    if let Ok(name) = self.header.get_string(node.name() as usize) {
-                        if name == node_name {
-                            return Some(index);
-                        }
-                    }
+            let node = match block {
+                NifBlock::NiNode(node) => node,
+                NifBlock::BSMultiBoundNode(block) => &block.node,
+                _ => continue,
+            };
+            if let Ok(name) = self.header.get_string(node.name() as usize) {
+                if name == node_name {
+                    return Some(index);
                 }
-                _ => {}
             }
         }
         None
@@ -497,6 +500,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                 block,
                 NifBlock::NiNode(_)
                     | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSMultiBoundNode(_)
                     | NifBlock::BSTriShape(_)
                     | NifBlock::BSDynamicTriShape(_)
                     | NifBlock::BSSubIndexTriShape(_)
@@ -506,6 +510,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
             .then_some(index as u32)
         })
         .collect();
+    let distant_lod_blocks = distant_lod_subtree_blocks(nif);
 
     for (index, block) in nif.blocks.iter().enumerate() {
         let block_index = index as u32;
@@ -523,17 +528,56 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                     None,
                 ));
             }
+            NifBlock::BSMultiBoundNode(block) => {
+                model.static_nodes.push(static_node_from_av(
+                    nif,
+                    block_index,
+                    &block.node.av,
+                    block
+                        .node
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|child| supported_blocks.contains(child))
+                        .collect(),
+                    None,
+                ));
+            }
             NifBlock::BSTriShape(shape) => {
-                push_modern_static_shape(nif, model, block_index, shape)?;
+                push_modern_static_shape(
+                    nif,
+                    model,
+                    block_index,
+                    shape,
+                    distant_lod_blocks[index],
+                )?;
             }
             NifBlock::BSDynamicTriShape(shape) => {
-                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+                push_modern_static_shape(
+                    nif,
+                    model,
+                    block_index,
+                    &shape.bs_tri_shape,
+                    distant_lod_blocks[index],
+                )?;
             }
             NifBlock::BSSubIndexTriShape(shape) => {
-                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+                push_modern_static_shape(
+                    nif,
+                    model,
+                    block_index,
+                    &shape.bs_tri_shape,
+                    distant_lod_blocks[index],
+                )?;
             }
             NifBlock::BSLODTriShape(shape) => {
-                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+                push_modern_static_shape(
+                    nif,
+                    model,
+                    block_index,
+                    &shape.bs_tri_shape,
+                    distant_lod_blocks[index],
+                )?;
             }
             NifBlock::NiTriShape(shape) => {
                 let data = nif
@@ -574,11 +618,42 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
     Ok(())
 }
 
+/// Marks the blocks a distant-LOD container holds: every `BSMultiBoundNode`
+/// (the root of the `.btr`/`.bto` meshes under `meshes/terrain/`) and its
+/// subtree. Shapes there can carry per-vertex tint, so they keep that
+/// attribute. Ordinary world meshes use vertex colours for shader effects the
+/// material contract does not model yet, and preserving them there would change
+/// how most converted statics render.
+pub(crate) fn distant_lod_subtree_blocks(nif: &NifFile) -> Vec<bool> {
+    let mut reached = vec![false; nif.blocks.len()];
+    let mut pending: Vec<u32> = nif
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            matches!(block, NifBlock::BSMultiBoundNode(_)).then_some(index as u32)
+        })
+        .collect();
+    while let Some(index) = pending.pop() {
+        let Some(slot) = reached.get_mut(index as usize) else {
+            continue;
+        };
+        if std::mem::replace(slot, true) {
+            continue;
+        }
+        if let Ok(node) = nif.blocks[index as usize].as_node() {
+            pending.extend(node.children.iter().copied());
+        }
+    }
+    reached
+}
+
 fn push_modern_static_shape(
     nif: &NifFile,
     model: &mut Model,
     block_index: u32,
     shape: &BSTriShape,
+    preserve_vertex_colors: bool,
 ) -> Result<(), String> {
     let name = nif
         .header
@@ -587,6 +662,21 @@ fn push_modern_static_shape(
         .map(str::to_owned);
     let mesh_index = model.static_meshes.len();
     let mut mesh = tri_shape_to_mesh(shape, name.clone());
+    if preserve_vertex_colors {
+        mesh.colors = shape
+            .vertex_data
+            .iter()
+            .filter_map(|vertex| vertex.vertex_colors)
+            .map(|color| {
+                BSVec4(glam::Vec4::new(
+                    f32::from(color.x) / 255.0,
+                    f32::from(color.y) / 255.0,
+                    f32::from(color.z) / 255.0,
+                    f32::from(color.w) / 255.0,
+                ))
+            })
+            .collect();
+    }
     if mesh.positions.is_empty() {
         if let Some(partition) = nif
             .blocks

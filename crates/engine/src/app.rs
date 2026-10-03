@@ -53,6 +53,11 @@ use std::{
 #[derive(Resource)]
 struct InitialCameraGroundHeight(f32);
 
+#[derive(Resource)]
+struct AssetDirectoryReadLock {
+    _guard: shared::asset_lock::AssetLock,
+}
+
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
     let shots = prepare_shots(&mut config)?;
@@ -63,6 +68,27 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
         Some(fixture)
+    } else {
+        None
+    };
+    let reads_asset_tree = config.streaming_fixture
+        || !(config.benchmark_only
+            || config.material_fixture
+            || config.terrain_water_fixture
+            || config.transform_bounds_fixture
+            || config.renderer_fixture
+            || config.physics_fixture);
+    let asset_lock = if reads_asset_tree {
+        Some(
+            shared::asset_lock::AssetLock::acquire_shared(&config.assets_dir).wrap_err_with(
+                || {
+                    format!(
+                        "engine cannot read assets at {}",
+                        config.assets_dir.display()
+                    )
+                },
+            )?,
+        )
     } else {
         None
     };
@@ -129,6 +155,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let mut app = App::new();
     if let Some(tuning) = movement_tuning {
         app.insert_resource(tuning);
+    }
+    if let Some(asset_lock) = asset_lock {
+        app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
     if benchmark_active || shots_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -411,15 +440,24 @@ impl StreamingFixtureDirectory {
         let connection = Connection::open(&database_path)?;
         connection.execute_batch(
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(4);
+            INSERT INTO schema_info VALUES(5);
             CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT,parent_world INTEGER,flags INTEGER,lod_origin_x INTEGER,lod_origin_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
             CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
             CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
+            CREATE TABLE lod_build(id INTEGER PRIMARY KEY CHECK (id=1),build_identity TEXT NOT NULL);
+            INSERT INTO lod_build VALUES(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+            CREATE TABLE lod_chunks(worldspace_id INTEGER,tier INTEGER,anchor_x INTEGER,anchor_y INTEGER,payload_path TEXT,content_hash TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,source_cells TEXT,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+            CREATE VIRTUAL TABLE lod_chunks_spatial USING rtree(id,minX,maxX,minY,maxY,+worldspace_id,+tier,+anchor_x,+anchor_y);
             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
+        )?;
+        connection.execute(
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES(?1,'Fixture',NULL,0,?2,?3)",
+            params![worldspace_id, start_grid.0, start_grid.1],
         )?;
         let mut insert = connection
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
@@ -1536,6 +1574,10 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
         );
     }
     if config.allow_incomplete_assets {
+        crate::world::database::validate_lod_build_contract(
+            &config.assets_dir,
+            converter_schema_version(),
+        )?;
         return Ok(());
     }
     let manifest_path = config.assets_dir.join("conversion-manifest.json");
@@ -1596,6 +1638,10 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             AssetSetRejection::IntegrationReportFailed
         )
     );
+    crate::world::database::validate_lod_build_contract(
+        &config.assets_dir,
+        converter_schema_version(),
+    )?;
     Ok(())
 }
 
@@ -1673,7 +1719,7 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    16
+    17
 }
 
 fn setup_synthetic_benchmark(
@@ -2062,7 +2108,11 @@ fn screenshot_assets_ready(
     metrics.pending_asset_instances == 0
         && metrics.pending_surface_instances == 0
         && metrics.loading_cells == 0
+        && metrics.pending_lod_queries == 0
+        && metrics.pending_lod_chunks == 0
         && metrics.failed_cells == 0
+        && metrics.unrecovered_lod_queries == 0
+        && metrics.unrecovered_lod_chunks == 0
         && (!world_streaming_active || metrics.resident_cells > 0)
         && metrics.asset_load_failures == 0
         && metrics.material_validation_failures == 0
@@ -2464,6 +2514,26 @@ mod tests {
         ));
     }
 
+    fn write_runtime_asset_database(path: &std::path::Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});
+                 CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_converter_schema_matches_the_actual_producer() {
+        assert_eq!(
+            converter_schema_version(),
+            converter::cache::CONVERTER_SCHEMA_VERSION
+        );
+    }
+
     /// The IO pool's stack has to hold a whole queue of loads nested inside one another, because a
     /// scope opened on a pool thread (bevy_gltf's texture scope) runs the other queued tasks on its
     /// own stack while it waits. This queues `LOADS` tasks behind a blocked single-thread pool,
@@ -2547,9 +2617,22 @@ mod tests {
         settled_metrics.resident_cells = 1;
         assert!(screenshot_assets_ready(&settled_metrics, true, &config));
 
-        let mut failed_metrics = settled_metrics;
+        let mut failed_metrics = settled_metrics.clone();
         failed_metrics.failed_cells = 1;
         assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
+
+        let mut pending_lod = settled_metrics.clone();
+        pending_lod.pending_lod_queries = 1;
+        assert!(!screenshot_assets_ready(&pending_lod, true, &config));
+
+        let mut failed_lod = settled_metrics;
+        failed_lod.failed_lod_chunks = 1;
+        assert!(screenshot_assets_ready(&failed_lod, true, &config));
+        failed_lod.unrecovered_lod_chunks = 1;
+        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        failed_lod.unrecovered_lod_chunks = 0;
+        failed_lod.unrecovered_lod_queries = 1;
+        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
     }
     /// The sun's shadows reach the grid the streamer draws, whichever way the camera faces, and the
     /// shader's view of them is usable: far bounds that increase (the shader takes the first bound a
@@ -2859,7 +2942,7 @@ mod tests {
     #[test]
     fn rejects_stale_or_incomplete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
@@ -3054,7 +3137,7 @@ mod tests {
     #[test]
     fn accepts_current_complete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
@@ -3079,14 +3162,17 @@ mod tests {
         validate_runtime_assets(&config).unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":5,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+            ),
         )
         .unwrap();
         assert!(
             validate_runtime_assets(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("schema 5 is unsupported")
+                .contains("schema 6 is unsupported")
         );
     }
 
@@ -3096,6 +3182,8 @@ mod tests {
         for required in ["skyrim_world.db", "cell_cache.rkyv"] {
             std::fs::write(directory.path().join(required), []).unwrap();
         }
+        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(4);").unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
             br#"{"schema_version":15,"complete":true}"#,
@@ -3118,6 +3206,8 @@ mod tests {
         // A real pre-merge conversion: converter schema 15 wrote world database schema 3.
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(3);").unwrap();
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
@@ -3140,7 +3230,7 @@ mod tests {
     fn rejects_truncated_manifest_and_integration_report() {
         for truncated_file in ["conversion-manifest.json", "integration-report.json"] {
             let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+            write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
             std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
             std::fs::write(
                 directory.path().join("conversion-manifest.json"),

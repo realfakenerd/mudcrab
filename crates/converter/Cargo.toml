@@ -34,9 +34,9 @@ mlua.workspace = true
 zstd = "0.13"
 # The encoder runs on native Vulkan, Metal or DX12 only (no GL, no WebGPU).
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+tempfile = "3.20"
 
 [dev-dependencies]
-tempfile = "3.20"
 insta = { version = "1.48", features = ["json", "redactions"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 ruzstd = "0.8"

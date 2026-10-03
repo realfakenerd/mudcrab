@@ -52,6 +52,8 @@ pub struct RunReport {
     pub cache_hits: u64,
     pub skipped: u64,
     pub warnings: Vec<String>,
+    pub lod_chunks: u64,
+    pub lod_warnings: Vec<String>,
     pub artifacts: usize,
     pub elapsed: Duration,
 }
@@ -64,6 +66,8 @@ impl RunReport {
             cache_hits: report.cache_hits,
             skipped: report.skipped,
             warnings: report.warnings.clone(),
+            lod_chunks: report.lod_chunks,
+            lod_warnings: report.lod_warnings.clone(),
             artifacts: report.artifacts.len(),
             elapsed: Duration::from_millis(report.elapsed_ms.min(u128::from(u64::MAX)) as u64),
         }
@@ -88,6 +92,33 @@ impl RunReport {
     /// What the run published, for the line under the summary.
     pub fn artifacts_line(&self) -> String {
         format!("{} artifact(s) published.", self.artifacts)
+    }
+
+    pub fn lod_line(&self) -> String {
+        let result = if self.lod_chunks == 0 {
+            "No terrain LOD generated".to_owned()
+        } else {
+            format!("Terrain LOD: {} chunks", self.lod_chunks)
+        };
+        format!(
+            "{result}; {} worldspace warning(s).",
+            self.lod_warnings.len()
+        )
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![self.headline(), self.artifacts_line(), self.lod_line()];
+        lines.extend(
+            self.warnings
+                .iter()
+                .map(|warning| format!("Warning: {warning}")),
+        );
+        lines.extend(
+            self.lod_warnings
+                .iter()
+                .map(|warning| format!("LOD: {warning}")),
+        );
+        lines
     }
 }
 
@@ -553,6 +584,8 @@ mod tests {
             cache_hits: 2,
             skipped: 0,
             warnings: Vec::new(),
+            lod_chunks: 0,
+            lod_warnings: Vec::new(),
             artifacts: 12,
             elapsed: Duration::from_secs(90),
         }
@@ -1318,6 +1351,8 @@ mod tests {
             artifacts: vec![PathBuf::from("a.glb"), PathBuf::from("b.ktx2")],
             inputs_by_kind: Default::default(),
             pruned_texture_references: 0,
+            lod_chunks: 1693,
+            lod_warnings: vec!["Solstheim terrain skipped".into()],
             elapsed_ms: 18_450_000,
             integration: None,
         };
@@ -1326,5 +1361,26 @@ mod tests {
         assert_eq!(report.elapsed, Duration::from_millis(18_450_000));
         assert!(report.headline().contains("Conversion incomplete"));
         assert!(report.artifacts_line().contains('2'));
+        assert_eq!(report.lod_chunks, 1693);
+        assert_eq!(report.lod_warnings, pipeline.lod_warnings);
+        assert_eq!(report.warnings, pipeline.warnings);
+        assert_eq!(
+            report.lod_line(),
+            "Terrain LOD: 1693 chunks; 1 worldspace warning(s)."
+        );
+        assert!(
+            report
+                .lines()
+                .contains(&"LOD: Solstheim terrain skipped".to_owned())
+        );
+    }
+
+    #[test]
+    fn zero_lod_chunks_are_not_reported_as_lod_coverage() {
+        let report = report(true);
+        assert_eq!(
+            report.lod_line(),
+            "No terrain LOD generated; 0 worldspace warning(s)."
+        );
     }
 }

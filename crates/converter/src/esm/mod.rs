@@ -16,6 +16,7 @@ pub mod cell_cache;
 pub mod exporter;
 pub mod extractors;
 pub mod load_order;
+pub mod lodsettings;
 pub mod mmap_reader;
 pub mod records;
 pub mod types;
@@ -413,6 +414,17 @@ fn remap_record_form_ids(
                 .wrap_err("VMAD references")?;
             continue;
         }
+        if tag.as_slice() == b"XESP"
+            && data.len() >= 8
+            && matches!(
+                &record.record_type,
+                b"REFR" | b"ACHR" | b"ACRE" | b"PGRE" | b"PMIS"
+            )
+        {
+            let parent = u32::from_le_bytes(data[..4].try_into().unwrap());
+            data[..4].copy_from_slice(&remap(parent)?.to_le_bytes());
+            continue;
+        }
         if is_form_id_subrecord(&record.record_type, tag, data.len()) {
             let value = u32::from_le_bytes(data[..4].try_into().unwrap());
             data[..4].copy_from_slice(
@@ -458,6 +470,42 @@ mod tests {
             u32::from_le_bytes(race.subrecords[0].1[..4].try_into().unwrap()),
             0x0300_1234
         );
+    }
+
+    #[test]
+    fn remaps_xesp_parents_for_normal_and_light_plugins_without_changing_flags() {
+        for light in [false, true] {
+            let normal = HashMap::from([("skyrim.esm".to_owned(), 0), ("mod.esm".to_owned(), 5)]);
+            let lights = if light {
+                HashMap::from([("mod.esm".to_owned(), 2)])
+            } else {
+                HashMap::new()
+            };
+            let mut xesp = 0x0100_0345u32.to_le_bytes().to_vec();
+            xesp.extend_from_slice(&1u32.to_le_bytes());
+            let mut reference = RawRecord {
+                form_id: 0x0100_1234,
+                record_type: *b"REFR",
+                flags: 0x800,
+                subrecords: vec![(b"XESP".to_vec(), xesp)],
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 5,
+            };
+            remap_record_form_ids(
+                &mut reference,
+                "mod.esm",
+                &["skyrim.esm".into()],
+                &normal,
+                &lights,
+                &RemapWarnings::default(),
+            )
+            .unwrap();
+            let parent = u32::from_le_bytes(reference.subrecords[0].1[..4].try_into().unwrap());
+            assert_eq!(parent, if light { 0xFE00_2345 } else { 0x0500_0345 });
+            assert_eq!(&reference.subrecords[0].1[4..], &1u32.to_le_bytes());
+            assert_eq!(reference.flags, 0x800);
+        }
     }
 
     #[test]

@@ -274,6 +274,20 @@ impl std::fmt::Debug for NifBlock {
     }
 }
 
+/// Drops the zero word a distant-LOD shape carries after its geometry.
+///
+/// The `BSTriShape` blocks of Skyrim's terrain LOD meshes (`meshes/terrain/**`
+/// `.btr`) are exactly their geometry payload plus one zero `u32`, which the
+/// payload itself does not account for, while ordinary shapes end at the
+/// payload. Anything else is left in place for the leftover warning.
+fn take_lod_shape_trailing_word(i: &[u8]) -> &[u8] {
+    if i.len() == 4 && i.iter().all(|byte| *byte == 0) {
+        &i[4..]
+    } else {
+        i
+    }
+}
+
 impl NifBlock {
     pub fn parse(i: &[u8], block_type: String) -> IResult<&[u8], Self> {
         match block_type.as_str() {
@@ -295,6 +309,7 @@ impl NifBlock {
 
             "BSTriShape" => {
                 let (i, result) = BSTriShape::parse(i)?;
+                let i = take_lod_shape_trailing_word(i);
                 if i.len() > 0 {
                     warn!("{} bytes left over after parsing BSTriShape", i.len());
                 }
@@ -329,6 +344,38 @@ impl NifBlock {
                     warn!("{} bytes left over after parsing BSLODTriShape", i.len());
                 }
                 Ok((i, NifBlock::BSLODTriShape(result)))
+            }
+
+            "BSMultiBoundNode" => {
+                let (i, result) = BSMultiBoundNode::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSMultiBoundNode", i.len());
+                }
+                Ok((i, NifBlock::BSMultiBoundNode(result)))
+            }
+
+            "BSMultiBound" => {
+                let (i, result) = BSMultiBound::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSMultiBound", i.len());
+                }
+                Ok((i, NifBlock::BSMultiBound(result)))
+            }
+
+            "BSMultiBoundAABB" => {
+                let (i, result) = BSMultiBoundAABB::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSMultiBoundAABB", i.len());
+                }
+                Ok((i, NifBlock::BSMultiBoundAABB(result)))
+            }
+
+            "BSMultiBoundOBB" => {
+                let (i, result) = BSMultiBoundOBB::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSMultiBoundOBB", i.len());
+                }
+                Ok((i, NifBlock::BSMultiBoundOBB(result)))
             }
 
             "NiSkinInstance" | "BSDismemberSkinInstance" => {
@@ -534,6 +581,7 @@ impl NifBlock {
     pub fn as_node(&self) -> Result<&NiNode, String> {
         match self {
             NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => Ok(node),
+            NifBlock::BSMultiBoundNode(block) => Ok(&block.node),
             _ => Err("Block is not a NiNode".to_string()),
         }
     }
@@ -752,21 +800,71 @@ pub struct BSMasterParticleSystem {
 pub struct BSMeshLODTriShape {
     // TODO
 }
+/// Bounding volume of a distant-LOD node. The block is only a reference to the
+/// volume data, which is one of `BSMultiBoundAABB` or `BSMultiBoundOBB`.
 #[derive(Debug)]
 pub struct BSMultiBound {
-    // TODO
+    pub data: MaxRef,
 }
-#[derive(Debug)]
+
+impl Parse<&[u8]> for BSMultiBound {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, data) = MaxRef::parse(i)?;
+        Ok((i, Self { data }))
+    }
+}
+
+/// Axis-aligned bounds of a `BSMultiBound`: its centre (`position`) and the
+/// full per-axis extent, both in the node's local space.
+#[derive(Debug, Clone, Copy, NomLE)]
 pub struct BSMultiBoundAABB {
-    // TODO
+    pub position: BSVec3,
+    pub extent: BSVec3,
 }
-#[derive(Debug)]
+
+/// Skyrim's distant-LOD container node (`meshes/terrain/**` `.btr`/`.bto`).
+///
+/// It is an `NiNode` with two extra fields, so its children join the scene
+/// hierarchy exactly as an `NiNode`'s do.
+#[derive(Debug, Clone)]
 pub struct BSMultiBoundNode {
-    // TODO
+    /// The node fields the scene hierarchy consumes.
+    pub node: NiNode,
+    /// Reference to the `BSMultiBound` block holding this node's volume.
+    pub bound: MaxRef,
+    /// `SkyrimLayer` culling mode Bethesda appended in version 83. Older
+    /// containers end after the bound reference, so the block's recorded size
+    /// decides whether it is present.
+    pub culling_mode: Option<u32>,
 }
-#[derive(Debug)]
+
+impl Parse<&[u8]> for BSMultiBoundNode {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, node) = NiNode::parse(i)?;
+        let (i, bound) = MaxRef::parse(i)?;
+        let (i, culling_mode) = if i.len() >= 4 {
+            let (i, culling_mode) = le_u32(i)?;
+            (i, Some(culling_mode))
+        } else {
+            (i, None)
+        };
+        Ok((
+            i,
+            Self {
+                node,
+                bound,
+                culling_mode,
+            },
+        ))
+    }
+}
+
+/// Oriented bounds of a `BSMultiBound`: centre, size and orientation.
+#[derive(Debug, Clone, Copy, NomLE)]
 pub struct BSMultiBoundOBB {
-    // TODO
+    pub center: BSVec3,
+    pub size: BSVec3,
+    pub rotation: BSMatrix3,
 }
 #[derive(Debug)]
 pub struct BSNiAlphaPropertyTestRefController {

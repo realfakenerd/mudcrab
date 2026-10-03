@@ -15,6 +15,9 @@ its own numbered file using a lightweight MADR-style format: **Status**, **Date*
 | [0007](0007-refuse-symlinked-path-components.md) | Fixture writes refuse symlinked path components | Accepted |
 | [0008](0008-cargo-audit-quick-xml-ignores.md) | `cargo audit` ignores two build-time-only `quick-xml` advisories | Accepted |
 | [0009](0009-cutout-vertex-alpha-normalization.md) | Normalize vertex alpha on Cutout shapes during conversion | Accepted |
+| [0010](0010-lod-chunk-payload-format.md) | LOD chunk payloads are GLB files, indexed by manifest | Proposed |
+| [0011](0011-lod-tier-selection-policy.md) | Fixed 4/8/16 tiers first; projected-size selection later | Proposed |
+| [0012](0012-billboard-atlas-layout.md) | Per-worldspace billboard atlases with gutters and layout versioning | Proposed |
 
 ADRs 0001–0008 were produced by the synthetic fixture generator work tracked in
 [issue #2](https://github.com/realfakenerd/OpenSkyrim/issues/2). Decisions for the NIF/ESM writers

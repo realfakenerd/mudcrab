@@ -6,6 +6,7 @@ use engine::world::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -18,6 +19,8 @@ const CELL_SIZE: f32 = 4096.0;
 fn main() -> Result<()> {
     color_eyre::install()?;
     let options = Options::parse(env::args_os().skip(1))?;
+    let _asset_lock = shared::asset_lock::AssetLock::acquire_shared(&options.assets)
+        .wrap_err_with(|| format!("cannot inspect assets at {}", options.assets.display()))?;
     let report = inspect_world(&options)?;
     let json = serde_json::to_vec_pretty(&report)?;
     if let Some(output) = &options.output {
@@ -101,8 +104,10 @@ struct InspectionReport {
     database_schema: u32,
     converter_manifest: ContractStatus,
     integration_report: ContractStatus,
+    lod_manifest: LodContractStatus,
     summary: InspectionSummary,
     cells: Vec<CellReport>,
+    lod_chunks: Vec<LodChunkReport>,
     references: Vec<ReferenceReport>,
     assets: Vec<AssetReport>,
 }
@@ -128,6 +133,30 @@ struct ContractStatus {
     exists: bool,
     schema_version: Option<u32>,
     passed: Option<bool>,
+}
+
+/// The LOD build-identity contract: the manifest on disk plus the identity
+/// the database claims, which must match before any chunk is trusted.
+#[derive(Debug, Serialize)]
+struct LodContractStatus {
+    path: String,
+    exists: bool,
+    manifest_identity: Option<String>,
+    database_identity: Option<String>,
+    identities_match: bool,
+    chunks: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LodChunkReport {
+    tier: i32,
+    anchor: [i32; 2],
+    payload_path: String,
+    payload_exists: bool,
+    content_hash_matches: Option<bool>,
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    source_cells: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +280,8 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         shared::WORLD_DATABASE_SCHEMA_VERSION
     );
     let cache = CellCache::open(&assets.join("cell_cache.rkyv"))?;
+    let lod_manifest = lod_contract_status(&assets, &connection);
+    let lod_chunks = load_lod_chunks(&connection, &assets, options.worldspace)?;
     let mut cells = Vec::new();
     let mut rows = Vec::new();
     for y in -options.radius..=options.radius {
@@ -363,11 +394,122 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         database_schema,
         converter_manifest: contract_status(&assets.join("conversion-manifest.json"), "complete"),
         integration_report: contract_status(&assets.join("integration-report.json"), "passed"),
+        lod_manifest,
         summary,
         cells,
+        lod_chunks,
         references,
         assets: assets_report,
     })
+}
+
+fn lod_contract_status(assets: &Path, connection: &Connection) -> LodContractStatus {
+    let path = assets.join("lod-manifest.json");
+    let manifest_identity = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("build_identity")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let database_identity: Option<String> = connection
+        .query_row(
+            "SELECT build_identity FROM lod_build WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+    let chunks: usize = connection
+        .query_row("SELECT count(*) FROM lod_chunks", [], |row| row.get(0))
+        .unwrap_or(0);
+    let identities_match = manifest_identity.is_some() && manifest_identity == database_identity;
+    LodContractStatus {
+        path: path.display().to_string(),
+        exists: path.is_file(),
+        manifest_identity,
+        database_identity,
+        identities_match,
+        chunks,
+    }
+}
+
+fn load_lod_chunks(
+    connection: &Connection,
+    assets: &Path,
+    worldspace: u32,
+) -> Result<Vec<LodChunkReport>> {
+    let has_lod_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lod_chunks')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_lod_table {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT tier, anchor_x, anchor_y, payload_path, content_hash,
+                bounds_min_x, bounds_min_y, bounds_min_z,
+                bounds_max_x, bounds_max_y, bounds_max_z, source_cells
+         FROM lod_chunks WHERE worldspace_id = ?1 ORDER BY tier, anchor_x, anchor_y",
+    )?;
+    let rows = statement.query_map([worldspace], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, i32>(1)?,
+            row.get::<_, i32>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            [
+                row.get::<_, f32>(5)?,
+                row.get::<_, f32>(6)?,
+                row.get::<_, f32>(7)?,
+            ],
+            [
+                row.get::<_, f32>(8)?,
+                row.get::<_, f32>(9)?,
+                row.get::<_, f32>(10)?,
+            ],
+            row.get::<_, String>(11)?,
+        ))
+    })?;
+    let mut chunks = Vec::new();
+    for row in rows {
+        let (
+            tier,
+            anchor_x,
+            anchor_y,
+            payload_path,
+            content_hash,
+            bounds_min,
+            bounds_max,
+            source_cells,
+        ) = row?;
+        let payload = assets.join(&payload_path);
+        let content_hash_matches = fs::read(&payload).ok().map(|bytes| {
+            let digest = sha2::Sha256::digest(&bytes);
+            let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            actual == content_hash
+        });
+        chunks.push(LodChunkReport {
+            tier,
+            anchor: [anchor_x, anchor_y],
+            payload_path,
+            payload_exists: payload.is_file(),
+            content_hash_matches,
+            bounds_min,
+            bounds_max,
+            source_cells: source_cells
+                .split(';')
+                .filter(|cell| !cell.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        });
+    }
+    Ok(chunks)
 }
 
 fn load_references(
@@ -737,6 +879,33 @@ fn parse_i32(value: Option<std::ffi::OsString>, name: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_database_without_lod_table_has_no_lod_chunks() {
+        let connection = Connection::open_in_memory().unwrap();
+        for schema in [3, 4] {
+            connection
+                .execute_batch(&format!(
+                    "DROP TABLE IF EXISTS schema_info; CREATE TABLE schema_info(version INTEGER);
+                     INSERT INTO schema_info VALUES ({schema});"
+                ))
+                .unwrap();
+            assert!(
+                load_lod_chunks(&connection, Path::new("unused"), 1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_present_lod_table_is_not_treated_as_legacy() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE lod_chunks(worldspace_id INTEGER);")
+            .unwrap();
+        assert!(load_lod_chunks(&connection, Path::new("unused"), 1).is_err());
+    }
 
     fn glb(json: Value) -> Vec<u8> {
         let mut json = serde_json::to_vec(&json).unwrap();

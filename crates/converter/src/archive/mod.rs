@@ -17,7 +17,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Component, Path, PathBuf},
@@ -173,6 +173,27 @@ impl ArchiveExtractor {
     pub fn extract(archive_path: &Path, output_root: &Path) -> Result<Vec<ExtractedFile>> {
         extract_reporting(archive_path, output_root, None, None)
     }
+
+    pub(crate) fn extract_lod_settings(
+        archive_path: &Path,
+        output_root: &Path,
+    ) -> Result<Vec<ExtractedFile>> {
+        extract_selected_reporting(archive_path, output_root, is_lod_setting, None, None)
+    }
+
+    pub(crate) fn extract_paths(
+        archive_path: &Path,
+        output_root: &Path,
+        paths: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<ExtractedFile>> {
+        extract_selected_reporting(
+            archive_path,
+            output_root,
+            |path| paths.contains(path),
+            None,
+            None,
+        )
+    }
 }
 
 /// Extracts every entry of an archive, reporting progress as the archive's file table allows, and
@@ -180,6 +201,16 @@ impl ArchiveExtractor {
 fn extract_reporting(
     archive_path: &Path,
     output_root: &Path,
+    progress: Option<ExtractionProgressCallback<'_>>,
+    stop: Option<StopCheck<'_>>,
+) -> Result<Vec<ExtractedFile>> {
+    extract_selected_reporting(archive_path, output_root, |_| true, progress, stop)
+}
+
+fn extract_selected_reporting(
+    archive_path: &Path,
+    output_root: &Path,
+    include: impl Fn(&Path) -> bool + Sync,
     progress: Option<ExtractionProgressCallback<'_>>,
     stop: Option<StopCheck<'_>>,
 ) -> Result<Vec<ExtractedFile>> {
@@ -204,6 +235,10 @@ fn extract_reporting(
                     Ok((entry, relative))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|(_, relative)| include(relative))
+                .collect();
             // A BSA's file records and payloads are both in the mapping, so the bytes it will
             // write are known before the first entry is decompressed.
             let reporter = progress.map(|callback| {
@@ -247,7 +282,8 @@ fn extract_reporting(
                 .collect()
         }
         Some(b"BTDX") => {
-            let entries = ba2::read_entries(&bytes)?;
+            let entries =
+                ba2::read_entries_matching(&bytes, |name| Ok(include(&safe_relative_path(name)?)))?;
             let mut seen = BTreeMap::new();
             let entries = entries
                 .into_iter()
@@ -257,6 +293,10 @@ fn extract_reporting(
                     Ok((name, data, relative))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|(_, _, relative)| include(relative))
+                .collect();
             let reporter = progress.map(|callback| {
                 ProgressReporter::new(
                     callback,
@@ -294,6 +334,10 @@ fn extract_reporting(
         }
         _ => bail!("unsupported archive magic in {}", archive_path.display()),
     }
+}
+
+fn is_lod_setting(path: &Path) -> bool {
+    path.starts_with("lodsettings") && path.extension().is_some_and(|extension| extension == "lod")
 }
 
 fn restore_cached_files(
@@ -460,6 +504,8 @@ pub(crate) fn safe_relative_path(name: &str) -> Result<PathBuf> {
             Some(AssetKind::Mesh)
         } else if extension.eq_ignore_ascii_case("pex") {
             Some(AssetKind::Script)
+        } else if extension.eq_ignore_ascii_case("lod") {
+            Some(AssetKind::LodSettings)
         } else {
             None
         }

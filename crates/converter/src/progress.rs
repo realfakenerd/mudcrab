@@ -10,6 +10,7 @@ pub enum ProgressStage {
     Textures,
     Meshes,
     Scripts,
+    LodChunks,
     Validating,
     Publishing,
     Complete,
@@ -25,13 +26,15 @@ pub enum ProgressStage {
 /// reuses most outputs moves through the early stages far faster than these shares assume, so the
 /// overall percentage runs ahead of the clock; that is right, because the run really is finishing
 /// sooner.
-const STAGE_WEIGHTS: [(ProgressStage, f32); 8] = [
+const STAGE_WEIGHTS: [(ProgressStage, f32); 9] = [
     (ProgressStage::Discovering, 0.005),
     (ProgressStage::Extracting, 0.04),
     (ProgressStage::Database, 0.025),
     (ProgressStage::Meshes, 0.01),
     (ProgressStage::Textures, 0.85),
     (ProgressStage::Scripts, 0.005),
+    // No calibrated LOD share yet; retain the measured weights and stage order.
+    (ProgressStage::LodChunks, 0.0),
     (ProgressStage::Validating, 0.04),
     (ProgressStage::Publishing, 0.025),
 ];
@@ -606,6 +609,7 @@ mod tests {
             ProgressStage::Meshes,
             ProgressStage::Textures,
             ProgressStage::Scripts,
+            ProgressStage::LodChunks,
             ProgressStage::Validating,
             ProgressStage::Publishing,
         ];
@@ -629,6 +633,7 @@ mod tests {
             ProgressStage::Meshes,
             ProgressStage::Textures,
             ProgressStage::Scripts,
+            ProgressStage::LodChunks,
             ProgressStage::Validating,
             ProgressStage::Publishing,
             ProgressStage::Complete,

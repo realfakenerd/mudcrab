@@ -1520,7 +1520,7 @@ mod tests {
         );
     }
 
-    /// The shader tiles every layer `tiling` times across a cell, so the layer textures
+    /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures
     /// must be sampled with a repeating address mode. Bevy's default clamps to the edge, which
     /// stretched the textures in the frames: everything past the first tile read the edge texels.
     #[test]

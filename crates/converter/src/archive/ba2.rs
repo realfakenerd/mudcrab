@@ -73,7 +73,15 @@ enum Record {
     Dx10(Dx10Record),
 }
 
+#[cfg(test)]
 pub(crate) fn read_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    read_entries_matching(bytes, |_| Ok(true))
+}
+
+pub(crate) fn read_entries_matching(
+    bytes: &[u8],
+    include: impl Fn(&str) -> Result<bool>,
+) -> Result<Vec<(String, Vec<u8>)>> {
     let header = parse_header(bytes)?;
     let records = match header.kind {
         ArchiveKind::General => parse_general_records(bytes, header)?,
@@ -84,7 +92,13 @@ pub(crate) fn read_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     records
         .into_iter()
         .zip(names)
-        .map(|(record, name)| {
+        .filter_map(|(record, name)| match include(&name) {
+            Ok(true) => Some(Ok((record, name))),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .map(|entry| {
+            let (record, name) = entry?;
             let data = match record {
                 Record::General(record) => extract_chunk(
                     bytes,

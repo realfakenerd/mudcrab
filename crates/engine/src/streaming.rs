@@ -30,9 +30,12 @@ use bevy::{
 use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody, WriteRapierContext};
 use serde::{Deserialize, Serialize};
 use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
+use shared::lod::LodTier;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::time::Instant;
+
+pub(crate) mod lod;
 
 // Wall-clock spans can include a short OS scheduler preemption. Keep the raw maximum in metrics,
 // but require a material overrun before classifying the frame as a commit-budget violation.
@@ -48,6 +51,17 @@ pub struct StreamingPlugin;
 #[derive(Component, Debug, Clone, Copy)]
 pub struct TerrainCollider;
 
+/// Grid cell and quadrant covered by a terrain surface at one LOD tier.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct TerrainCoverage {
+    grid: IVec2,
+    quadrant: u8,
+    tier: Option<LodTier>,
+}
+
+#[derive(Component)]
+struct TerrainSurfaceReady;
+
 /// A fixed placement's collision provenance.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticColliderSource {
@@ -59,20 +73,28 @@ impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
             .init_resource::<StaticCollisionCache>()
             .add_observer(mark_world_instance_ready)
+            .add_observer(lod::mark_lod_world_instance_ready)
             .add_systems(
                 Update,
                 (
                     plan_cells,
                     despawn_cells,
+                    lod::plan_lod_chunks,
                     collect_cells,
+                    lod::collect_lod_chunks,
                     arm_pending_models,
+                    finish_streaming_commit_budget,
                     track_asset_readiness,
                     track_surface_readiness,
+                    lod::track_lod_readiness,
+                    lod::update_terrain_lod_visibility,
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
@@ -131,6 +153,38 @@ impl StreamingWorld {
             profiler.event(format!("{key:?}"), "requested", None);
             self.cells.insert(key, CellStatus::Loading { generation });
         }
+    }
+}
+
+#[derive(Resource)]
+struct StreamingCommitBudget {
+    frame_started: Instant,
+    remaining: usize,
+    commits: usize,
+    lod_priority: bool,
+    reserved_for_lod: bool,
+}
+
+impl Default for StreamingCommitBudget {
+    fn default() -> Self {
+        Self {
+            frame_started: Instant::now(),
+            remaining: 0,
+            commits: 0,
+            lod_priority: false,
+            reserved_for_lod: false,
+        }
+    }
+}
+
+impl StreamingCommitBudget {
+    fn reserve_for_lod(&mut self, waiting: bool, frame_limit: usize) {
+        self.reserved_for_lod = waiting && (self.lod_priority || frame_limit > 1);
+    }
+
+    fn remaining_for_cells(&self) -> usize {
+        self.remaining
+            .saturating_sub(usize::from(self.reserved_for_lod))
     }
 }
 
@@ -241,6 +295,23 @@ pub struct StreamingMetrics {
     pub transform_bounds_fixture_validated: bool,
     pub active_requests: usize,
     pub peak_active_requests: usize,
+    pub lod_queries_submitted: u64,
+    pub lod_query_responses: u64,
+    pub lod_query_submission_failures: u64,
+    pub stale_lod_query_responses: u64,
+    pub failed_lod_queries: u64,
+    pub unrecovered_lod_queries: usize,
+    pub pending_lod_queries: usize,
+    pub lod_chunks_requested: u64,
+    pub lod_chunks_ready: u64,
+    pub failed_lod_chunks: u64,
+    pub unrecovered_lod_chunks: usize,
+    pub resident_lod_chunks: usize,
+    pub pending_lod_chunks: usize,
+    pub ready_lod_terrain_patches: u64,
+    pub visible_lod_terrain_patches: usize,
+    pub total_lod_query_micros: u64,
+    pub max_lod_query_micros: u64,
     pub resident_roots: usize,
     pub duplicate_cell_roots: u64,
     pub orphaned_cell_roots: u64,
@@ -419,11 +490,16 @@ fn plan_cells(
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut streaming: ResMut<StreamingWorld>,
+    mut commit_budget: ResMut<StreamingCommitBudget>,
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let plan_started = Instant::now();
+    commit_budget.remaining = config.max_cell_commits_per_frame;
+    commit_budget.commits = 0;
+    commit_budget.lod_priority = !commit_budget.lod_priority;
+    commit_budget.reserved_for_lod = false;
     let Ok(camera) = camera.single() else {
         return;
     };
@@ -576,6 +652,9 @@ fn despawn_cells(world: &mut World) {
     for (_, root) in retiring.iter().take(budget) {
         entities = entities.saturating_add(despawn_subtree(world, *root));
     }
+    if budget > 0 {
+        world.resource_mut::<lod::LodStreaming>().visibility_dirty = true;
+    }
     {
         let mut streaming = world.resource_mut::<StreamingWorld>();
         for (key, _) in retiring.iter().take(budget) {
@@ -657,13 +736,18 @@ fn collect_cells(
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut streaming: ResMut<StreamingWorld>,
+    mut commit_budget: ResMut<StreamingCommitBudget>,
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let frame_commit_started = Instant::now();
-    let mut commits_this_frame = 0u64;
-    for _ in 0..config.max_cell_commits_per_frame {
+    commit_budget.frame_started = frame_commit_started;
+    let response_scan_limit = config.max_cell_commits_per_frame.saturating_mul(8).max(8);
+    for _ in 0..response_scan_limit {
+        if commit_budget.remaining_for_cells() == 0 {
+            break;
+        }
         let Some(response) = database.try_response() else {
             break;
         };
@@ -700,6 +784,8 @@ fn collect_cells(
             profiler.event(format!("{:?}", response.key), "stale_generation", None);
             continue;
         }
+        commit_budget.remaining -= 1;
+        commit_budget.commits = commit_budget.commits.saturating_add(1);
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
@@ -781,7 +867,6 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
-        commits_this_frame = commits_this_frame.saturating_add(1);
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
@@ -789,28 +874,38 @@ fn collect_cells(
             Some(commit_micros as f64 / 1000.0),
         );
     }
-    if commits_this_frame > 0 {
-        let frame_micros = frame_commit_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
-        metrics.total_frame_commit_micros = metrics
-            .total_frame_commit_micros
-            .saturating_add(frame_micros);
-        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
-        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
-            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
-            profiler.event(
-                "streaming",
-                "commit_budget_exceeded",
-                Some(frame_micros as f64 / 1_000.0),
-            );
-        }
-        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
-        profiler.record_micros("streaming/frame_commit", frame_micros);
+}
+
+fn finish_streaming_commit_budget(
+    config: Res<EngineConfig>,
+    budget: Res<StreamingCommitBudget>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if budget.commits == 0 {
+        return;
     }
+    let frame_micros = budget
+        .frame_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+    metrics.total_frame_commit_micros = metrics
+        .total_frame_commit_micros
+        .saturating_add(frame_micros);
+    metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+    metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+    if commit_budget_exceeded(frame_micros, metrics.commit_budget_micros) {
+        metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+        profiler.event(
+            "streaming",
+            "commit_budget_exceeded",
+            Some(frame_micros as f64 / 1_000.0),
+        );
+    }
+    profiler.set_gauge("streaming/commits_this_frame", budget.commits as f64);
+    profiler.record_micros("streaming/frame_commit", frame_micros);
 }
 
 /// The exterior grid square the camera is over: its rebased translation, put back through the
@@ -857,6 +952,10 @@ fn spawn_cell(
     let spawn_started = Instant::now();
     let reference_count = payload.references.len();
     let root_translation = cell_translation(payload.key, origin);
+    let terrain_grid = match payload.key {
+        CellKey::Exterior { grid_x, grid_y, .. } => Some(IVec2::new(grid_x, grid_y)),
+        CellKey::Interior(_) => None,
+    };
     let terrain_quadrants = if let Some(terrain) = &terrain {
         (0..4)
             .map(|quadrant| {
@@ -913,6 +1012,13 @@ fn spawn_cell(
                         normals: images.normal,
                     },
                 ));
+                if let Some(grid) = terrain_grid {
+                    patch.insert(TerrainCoverage {
+                        grid,
+                        quadrant,
+                        tier: None,
+                    });
+                }
                 if let Some(collider) = collider {
                     patch.insert((
                         TerrainCollider,
@@ -1859,6 +1965,7 @@ fn track_surface_readiness(
     )>,
     water: Query<(Entity, &PendingWaterProfile)>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut lod_streaming: ResMut<lod::LodStreaming>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1917,7 +2024,10 @@ fn track_surface_readiness(
                     .images_validated
                     .saturating_add((pending.images.len() + normals_validated) as u64);
                 profiler.increment("terrain/patches_validated", 1);
-                commands.entity(entity).insert(Visibility::Inherited);
+                commands
+                    .entity(entity)
+                    .insert((Visibility::Inherited, TerrainSurfaceReady));
+                lod_streaming.visibility_dirty = true;
                 commands.entity(entity).remove::<ColliderDisabled>();
                 commands.entity(entity).remove::<PendingTerrainProfile>();
                 completed += 1;
@@ -3071,8 +3181,13 @@ fn update_render_origin(
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<
-        (&ExteriorCellGrid, &mut Transform),
         (
+            Option<&ExteriorCellGrid>,
+            Option<&lod::LodChunkGridOrigin>,
+            &mut Transform,
+        ),
+        (
+            Or<(With<ExteriorCellGrid>, With<lod::LodChunkGridOrigin>)>,
             Without<StreamingCamera>,
             Without<PlayerBody>,
             Without<DebugTankard>,
@@ -3132,11 +3247,17 @@ fn update_render_origin(
         }
         context.propagate_modified_body_positions_to_colliders();
     }
-    for (grid, mut transform) in &mut roots {
+    for (cell_grid, lod_grid, mut transform) in &mut roots {
+        let Some(grid) = cell_grid
+            .map(|grid| (i64::from(grid.0.x), i64::from(grid.0.y)))
+            .or_else(|| lod_grid.map(|grid| (grid.grid_x, grid.grid_y)))
+        else {
+            continue;
+        };
         transform.translation = Vec3::new(
-            (grid.0.x - origin.0.x) as f32 * CELL_SIZE,
+            (grid.0 - i64::from(origin.0.x)) as f32 * CELL_SIZE,
             0.0,
-            -(grid.0.y - origin.0.y) as f32 * CELL_SIZE,
+            -((grid.1 - i64::from(origin.0.y)) as f32) * CELL_SIZE,
         );
     }
     profiler.increment("streaming/origin_rebases", 1);
@@ -3242,6 +3363,33 @@ mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
     use bevy_rapier3d::prelude::{QueryFilter, ReadRapierContext};
+
+    #[test]
+    fn one_commit_budget_alternates_priority_without_starving_cells_or_lod() {
+        let mut budget = StreamingCommitBudget {
+            remaining: 1,
+            ..Default::default()
+        };
+        budget.reserve_for_lod(true, 1);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.lod_priority = true;
+        budget.reserve_for_lod(true, 1);
+        assert_eq!(budget.remaining_for_cells(), 0);
+        budget.reserve_for_lod(false, 1);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.remaining = 2;
+        budget.lod_priority = false;
+        budget.reserve_for_lod(true, 2);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.remaining -= 1;
+        assert_eq!(
+            budget.remaining_for_cells(),
+            0,
+            "reservation survives a near-cell commit"
+        );
+        budget.remaining = 0;
+        assert_eq!(budget.remaining_for_cells(), 0);
+    }
 
     #[test]
     fn multiple_authored_meshes_attach_to_one_fixed_body_without_nested_composites() {
@@ -3890,6 +4038,8 @@ mod tests {
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ProfilingState>()
             .add_systems(
@@ -4777,6 +4927,7 @@ mod tests {
         .insert_resource(EngineConfig::default())
         .init_resource::<StreamingMetrics>()
         .init_resource::<StreamingWorld>()
+        .init_resource::<lod::LodStreaming>()
         .init_resource::<TerrainContinuity>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()

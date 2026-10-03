@@ -32,8 +32,10 @@ fn run_gen(arguments: &[String]) -> Result<()> {
     let mut formats = options.formats;
     if options.with_interior || options.with_lights {
         // A preset writes the plugin itself, so the default one is not
-        // generated: each preset replaces `Skyrim.esm`.
+        // generated: each preset replaces `Skyrim.esm`, and the sidecar
+        // requires the stock plugin.
         formats.esm = false;
+        formats.lodsettings = false;
     }
     layout::prepare_directory(&options.output, options.force)?;
     let mut written = layout::generate(&options.output, options.seed, formats)?;
@@ -183,7 +185,8 @@ COMMANDS:
 
 OPTIONS:
     --seed <n>        Seed for generated texture content
-    --formats <list>  Comma-separated subset of: dds, pex, nif, bsa, ba2, esm
+    --formats <list>  Comma-separated subset of: dds, pex, nif, bsa, ba2, esm,
+                      lodsettings (needs esm)
     --force           Overwrite generated files in a non-empty directory
     --with-interior   Write Skyrim.esm with one exterior cell, one interior
                       cell and a reciprocal pair of load doors (needs esm)

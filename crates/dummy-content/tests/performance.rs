@@ -122,7 +122,10 @@ fn performance_layout_generation_stays_within_budget() {
         layout::prepare_directory(&root, true).unwrap();
         let written =
             layout::generate(&root, layout::DEFAULT_SEED, layout::Formats::all()).unwrap();
-        assert_eq!(written.len(), 12);
+        assert_eq!(written.len(), 13);
+        let lod_settings = root.join(format!("lodsettings/{}.lod", layout::GENERATED_WORLDSPACE));
+        assert!(written.contains(&lod_settings));
+        assert!(lod_settings.is_file());
         black_box(written);
     });
     assert!(

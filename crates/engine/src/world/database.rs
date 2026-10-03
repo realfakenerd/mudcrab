@@ -1,8 +1,11 @@
 use bevy::prelude::Resource;
 use color_eyre::{Result, eyre::WrapErr};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
+use serde::Deserialize;
+use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin, LodTier, chunk_payload_path};
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{
         Arc,
@@ -78,6 +81,11 @@ pub enum DatabaseRequest {
         key: CellKey,
         queued_at: Instant,
     },
+    LoadLodChunks {
+        generation: u64,
+        query: LodChunkQuery,
+        queued_at: Instant,
+    },
     Shutdown,
 }
 
@@ -92,10 +100,80 @@ pub struct DatabaseResponse {
     pub row_count: usize,
 }
 
+/// World-space AABB used to discover LOD chunks. Bounds are XY Creation units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LodChunkQuery {
+    pub worldspace_id: u32,
+    pub tier: LodTier,
+    pub bounds_min: [f64; 2],
+    pub bounds_max: [f64; 2],
+}
+
+/// Validated world-space bounds stored for an LOD chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LodChunkBounds {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+/// Database metadata needed to validate and place one file-backed LOD chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LodChunkMetadata {
+    pub key: ChunkKey,
+    /// Canonical path relative to the converted assets root.
+    pub payload_path: String,
+    /// Lowercase SHA-256 of the published GLB payload.
+    pub content_hash: String,
+    pub bounds: LodChunkBounds,
+    /// Source exterior cells as absolute `(grid_x, grid_y)` coordinates.
+    pub source_cells: Vec<[i32; 2]>,
+    pub build_identity: String,
+    pub origin: LodOrigin,
+}
+
+/// Generation-tagged result of an asynchronous LOD range query.
+#[derive(Debug)]
+pub struct LodChunkResponse {
+    pub generation: u64,
+    pub query: LodChunkQuery,
+    pub result: std::result::Result<Vec<LodChunkMetadata>, LodQueryFailure>,
+    pub query_micros: u64,
+    pub queue_wait_micros: u64,
+    pub total_request_micros: u64,
+    pub chunk_count: usize,
+}
+
+/// Whether an asynchronous query failed temporarily or rejected invalid metadata.
+#[derive(Debug)]
+pub struct LodQueryFailure {
+    pub transient: bool,
+    pub reason: String,
+}
+
+impl LodQueryFailure {
+    fn from_error(error: color_eyre::Report) -> Self {
+        let transient = error.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+            matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::SystemIoFailure))
+        });
+        Self {
+            transient,
+            reason: format!("{error:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for LodQueryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
 #[derive(Resource)]
 pub struct WorldDatabase {
     requests: Sender<DatabaseRequest>,
     responses: Receiver<DatabaseResponse>,
+    lod_responses: Receiver<LodChunkResponse>,
     worker: Option<thread::JoinHandle<()>>,
     worker_stopped: Arc<AtomicBool>,
 }
@@ -268,18 +346,20 @@ impl WorldDatabase {
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
         let (response_tx, response_rx) = unbounded();
+        let (lod_response_tx, lod_response_rx) = unbounded();
         let worker_stopped = Arc::new(AtomicBool::new(false));
         let stopped = worker_stopped.clone();
         let worker = thread::Builder::new()
             .name("openskyrim-world-db".into())
             .spawn(move || {
-                worker(path, request_rx, response_tx);
+                worker(path, request_rx, response_tx, lod_response_tx);
                 stopped.store(true, Ordering::Release);
             })
             .wrap_err("failed to start world database worker")?;
         Ok(Self {
             requests: request_tx,
             responses: response_rx,
+            lod_responses: lod_response_rx,
             worker: Some(worker),
             worker_stopped,
         })
@@ -293,6 +373,37 @@ impl WorldDatabase {
 
     pub fn try_response(&self) -> Option<DatabaseResponse> {
         self.responses.try_recv().ok()
+    }
+
+    /// Queue a world-space LOD chunk range query on the existing database worker.
+    pub fn request_lod_chunks(&self, generation: u64, query: LodChunkQuery) -> Result<()> {
+        enqueue_lod_query(&self.requests, generation, query)
+    }
+
+    /// Read the next LOD response without consuming ordinary cell responses.
+    pub fn try_lod_response(&self) -> Option<LodChunkResponse> {
+        self.lod_responses.try_recv().ok()
+    }
+}
+
+fn enqueue_lod_query(
+    requests: &Sender<DatabaseRequest>,
+    generation: u64,
+    query: LodChunkQuery,
+) -> Result<()> {
+    let request = DatabaseRequest::LoadLodChunks {
+        generation,
+        query,
+        queued_at: Instant::now(),
+    };
+    match requests.try_send(request) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(color_eyre::eyre::eyre!(
+            "world database request queue is full"
+        )),
+        Err(TrySendError::Disconnected(_)) => {
+            Err(color_eyre::eyre::eyre!("world database worker stopped"))
+        }
     }
 }
 
@@ -323,10 +434,86 @@ fn validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_lod_build_contract(assets_dir: &Path, converter_schema: u32) -> Result<()> {
+    let database_path = assets_dir.join("skyrim_world.db");
+    validate(&database_path)?;
+    let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
+    let manifest_path = assets_dir.join("lod-manifest.json");
+    if !has_lod_table(&connection)? {
+        let version: u32 =
+            connection.query_row("SELECT version FROM schema_info", [], |row| row.get(0))?;
+        color_eyre::eyre::ensure!(
+            version < 5 && !manifest_path.exists(),
+            "world database has no LOD chunk table"
+        );
+        return Ok(());
+    }
+    let chunk_count: i64 = connection
+        .query_row("SELECT count(*) FROM lod_chunks", [], |row| row.get(0))
+        .wrap_err("world database has no LOD chunk table")?;
+    if !manifest_path.is_file() {
+        color_eyre::eyre::ensure!(
+            chunk_count == 0,
+            "world database contains {chunk_count} LOD chunks but {} is missing",
+            manifest_path.display()
+        );
+        return Ok(());
+    }
+
+    let bytes = std::fs::read(&manifest_path)
+        .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: LodBuildManifest =
+        serde_json::from_slice(&bytes).wrap_err("invalid LOD build manifest")?;
+    color_eyre::eyre::ensure!(
+        manifest.land_texture_repeats_per_cell == shared::LAND_TEXTURE_REPEATS_PER_CELL,
+        "LOD terrain texture scale is stale; rebuild LOD metadata for {} repeats per cell",
+        shared::LAND_TEXTURE_REPEATS_PER_CELL
+    );
+    color_eyre::eyre::ensure!(
+        manifest.converter_schema == converter_schema
+            && manifest.world_database_schema == shared::WORLD_DATABASE_SCHEMA_VERSION,
+        "LOD manifest schema is stale; reconvert assets with converter schema {converter_schema} and world database schema {}",
+        shared::WORLD_DATABASE_SCHEMA_VERSION
+    );
+    color_eyre::eyre::ensure!(
+        is_canonical_sha256(&manifest.build_identity),
+        "LOD manifest build identity is not a lowercase SHA-256 digest"
+    );
+    let database_identity: String = connection
+        .query_row(
+            "SELECT build_identity FROM lod_build WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .wrap_err("world database has no LOD build identity")?;
+    color_eyre::eyre::ensure!(
+        database_identity == manifest.build_identity,
+        "LOD database and manifest build identities do not match"
+    );
+    color_eyre::eyre::ensure!(
+        u64::try_from(chunk_count).ok() == Some(manifest.chunks),
+        "LOD manifest declares {} chunks but the world database contains {chunk_count}",
+        manifest.chunks
+    );
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct LodBuildManifest {
+    build_identity: String,
+    converter_schema: u32,
+    world_database_schema: u32,
+    chunks: u64,
+    #[serde(default)]
+    land_texture_repeats_per_cell: f32,
+}
+
 fn worker(
     path: std::path::PathBuf,
     requests: Receiver<DatabaseRequest>,
     responses: Sender<DatabaseResponse>,
+    lod_responses: Sender<LodChunkResponse>,
 ) {
     // Which optional tables and columns this database has does not change while it is open, so
     // the reference query is built once for the connection. If the database cannot be opened or
@@ -343,45 +530,299 @@ fn worker(
     })
     .map_err(|error| format!("world database {} is unusable: {error:#}", path.display()));
     while let Ok(request) = requests.recv() {
-        let DatabaseRequest::Load {
-            generation,
-            key,
-            queued_at,
-        } = request
-        else {
-            break;
-        };
-        let queue_wait_micros = elapsed_micros(queued_at);
-        let started = Instant::now();
-        let result = match &setup {
-            Ok((connection, query)) => {
-                load_cell(connection, query, generation, key).map_err(|error| format!("{error:#}"))
-            }
-            Err(error) => Err(error.clone()),
-        };
-        let query_micros = elapsed_micros(started);
-        let row_count = result
-            .as_ref()
-            .map_or(0, |payload| payload.references.len());
-        if responses
-            .send(DatabaseResponse {
+        match request {
+            DatabaseRequest::Shutdown => break,
+            DatabaseRequest::Load {
                 generation,
                 key,
-                result,
-                query_micros,
-                queue_wait_micros,
-                total_request_micros: elapsed_micros(queued_at),
-                row_count,
-            })
-            .is_err()
-        {
-            break;
+                queued_at,
+            } => {
+                let queue_wait_micros = elapsed_micros(queued_at);
+                let started = Instant::now();
+                let result = match &setup {
+                    Ok((connection, query)) => load_cell(connection, query, generation, key)
+                        .map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(error.clone()),
+                };
+                let query_micros = elapsed_micros(started);
+                let row_count = result
+                    .as_ref()
+                    .map_or(0, |payload| payload.references.len());
+                if responses
+                    .send(DatabaseResponse {
+                        generation,
+                        key,
+                        result,
+                        query_micros,
+                        queue_wait_micros,
+                        total_request_micros: elapsed_micros(queued_at),
+                        row_count,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            DatabaseRequest::LoadLodChunks {
+                generation,
+                query,
+                queued_at,
+            } => {
+                let queue_wait_micros = elapsed_micros(queued_at);
+                let started = Instant::now();
+                let result = match &setup {
+                    Ok((connection, _)) => {
+                        load_lod_chunks(connection, query).map_err(LodQueryFailure::from_error)
+                    }
+                    Err(error) => Err(LodQueryFailure {
+                        transient: false,
+                        reason: error.clone(),
+                    }),
+                };
+                let query_micros = elapsed_micros(started);
+                let chunk_count = result.as_ref().map_or(0, Vec::len);
+                if lod_responses
+                    .send(LodChunkResponse {
+                        generation,
+                        query,
+                        result,
+                        query_micros,
+                        queue_wait_micros,
+                        total_request_micros: elapsed_micros(queued_at),
+                        chunk_count,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<LodChunkMetadata>> {
+    validate_lod_query(query)?;
+
+    if !has_lod_table(connection)? {
+        let version: u32 =
+            connection.query_row("SELECT version FROM schema_info", [], |row| row.get(0))?;
+        color_eyre::eyre::ensure!(version < 5, "world database has no LOD chunk table");
+        return Ok(Vec::new());
+    }
+    let has_chunks: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lod_chunks WHERE worldspace_id=?1)",
+        [query.worldspace_id],
+        |row| row.get(0),
+    )?;
+    if !has_chunks {
+        return Ok(Vec::new());
+    }
+
+    let (origin_x, origin_y): (Option<i32>, Option<i32>) = connection
+        .query_row(
+            "SELECT lod_origin_x,lod_origin_y FROM worldspaces WHERE id=?1",
+            [query.worldspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .wrap_err_with(|| {
+            format!(
+                "LOD worldspace {} is missing from worldspaces or has invalid origin columns",
+                query.worldspace_id
+            )
+        })?;
+    let origin = LodOrigin::new(
+        origin_x.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "LOD worldspace {} has no valid X origin",
+                query.worldspace_id
+            )
+        })?,
+        origin_y.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "LOD worldspace {} has no valid Y origin",
+                query.worldspace_id
+            )
+        })?,
+    );
+
+    let build_identity: String = connection
+        .query_row(
+            "SELECT build_identity FROM lod_build WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .wrap_err("LOD build identity is missing from lod_build")?;
+    color_eyre::eyre::ensure!(
+        is_canonical_sha256(&build_identity),
+        "LOD build identity is not a lowercase SHA-256 digest"
+    );
+
+    let mut statement = connection.prepare_cached(
+        "SELECT DISTINCT c.worldspace_id,c.tier,c.anchor_x,c.anchor_y,c.payload_path,c.content_hash,\
+         c.bounds_min_x,c.bounds_min_y,c.bounds_min_z,c.bounds_max_x,c.bounds_max_y,c.bounds_max_z,\
+         c.source_cells FROM lod_chunks_spatial r \
+         JOIN lod_chunks c ON c.worldspace_id=r.worldspace_id AND c.tier=r.tier \
+         AND c.anchor_x=r.anchor_x AND c.anchor_y=r.anchor_y \
+         WHERE r.worldspace_id=?1 AND r.tier=?2 \
+         AND r.minX<=?4 AND r.maxX>=?3 AND r.minY<=?6 AND r.maxY>=?5",
+    )?;
+    let rows = statement.query_map(
+        params![
+            query.worldspace_id,
+            query.tier.side_cells(),
+            query.bounds_min[0],
+            query.bounds_max[0],
+            query.bounds_min[1],
+            query.bounds_max[1],
+        ],
+        RawLodChunk::from_row,
+    )?;
+
+    rows.map(|row| {
+        let raw = row?;
+        validate_lod_chunk(raw, query.worldspace_id, origin, &build_identity)
+    })
+    .collect()
+}
+
+fn has_lod_table(connection: &Connection) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lod_chunks')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_lod_query(query: LodChunkQuery) -> Result<()> {
+    for (axis, min, max) in [
+        ("X", query.bounds_min[0], query.bounds_max[0]),
+        ("Y", query.bounds_min[1], query.bounds_max[1]),
+    ] {
+        color_eyre::eyre::ensure!(
+            min.is_finite() && max.is_finite() && min <= max,
+            "LOD query has non-finite or unordered {axis} bounds: {min}..{max}"
+        );
+    }
+    Ok(())
+}
+
+struct RawLodChunk {
+    worldspace_id: i64,
+    tier: i64,
+    anchor_x: i64,
+    anchor_y: i64,
+    payload_path: String,
+    content_hash: String,
+    bounds_min: [f64; 3],
+    bounds_max: [f64; 3],
+    source_cells: String,
+}
+
+impl RawLodChunk {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            worldspace_id: row.get(0)?,
+            tier: row.get(1)?,
+            anchor_x: row.get(2)?,
+            anchor_y: row.get(3)?,
+            payload_path: row.get(4)?,
+            content_hash: row.get(5)?,
+            bounds_min: [row.get(6)?, row.get(7)?, row.get(8)?],
+            bounds_max: [row.get(9)?, row.get(10)?, row.get(11)?],
+            source_cells: row.get(12)?,
+        })
+    }
+}
+
+fn validate_lod_chunk(
+    raw: RawLodChunk,
+    requested_worldspace: u32,
+    origin: LodOrigin,
+    build_identity: &str,
+) -> Result<LodChunkMetadata> {
+    let worldspace_id = u32::try_from(raw.worldspace_id)
+        .wrap_err_with(|| format!("LOD chunk has invalid worldspace id {}", raw.worldspace_id))?;
+    color_eyre::eyre::ensure!(
+        worldspace_id == requested_worldspace,
+        "LOD chunk worldspace {worldspace_id} does not match requested worldspace {requested_worldspace}"
+    );
+    let tier = lod_tier_from_database(raw.tier)?;
+    let anchor_x = i32::try_from(raw.anchor_x)
+        .wrap_err_with(|| format!("LOD chunk has invalid anchor X {}", raw.anchor_x))?;
+    let anchor_y = i32::try_from(raw.anchor_y)
+        .wrap_err_with(|| format!("LOD chunk has invalid anchor Y {}", raw.anchor_y))?;
+    let key = ChunkKey::new(worldspace_id, tier, ChunkAnchor::new(anchor_x, anchor_y));
+
+    let canonical_path = chunk_payload_path(key);
+    color_eyre::eyre::ensure!(
+        is_safe_relative_asset_path(&raw.payload_path) && raw.payload_path == canonical_path,
+        "LOD chunk {key:?} has unsafe or non-canonical payload path {:?}; expected {canonical_path:?}",
+        raw.payload_path
+    );
+    color_eyre::eyre::ensure!(
+        is_canonical_sha256(&raw.content_hash),
+        "LOD chunk {key:?} has an invalid content hash"
+    );
+    for axis in 0..3 {
+        color_eyre::eyre::ensure!(
+            raw.bounds_min[axis].is_finite()
+                && raw.bounds_max[axis].is_finite()
+                && raw.bounds_min[axis] <= raw.bounds_max[axis],
+            "LOD chunk {key:?} has non-finite or unordered world-space bounds on axis {axis}"
+        );
+    }
+
+    Ok(LodChunkMetadata {
+        key,
+        payload_path: raw.payload_path,
+        content_hash: raw.content_hash,
+        bounds: LodChunkBounds {
+            min: raw.bounds_min,
+            max: raw.bounds_max,
+        },
+        source_cells: parse_source_cells(&raw.source_cells)
+            .wrap_err_with(|| format!("LOD chunk {key:?} has invalid source_cells metadata"))?,
+        build_identity: build_identity.to_owned(),
+        origin,
+    })
+}
+
+fn lod_tier_from_database(value: i64) -> Result<LodTier> {
+    let side_cells =
+        i32::try_from(value).wrap_err_with(|| format!("LOD chunk has invalid tier {value}"))?;
+    LodTier::from_side_cells(side_cells)
+        .ok_or_else(|| color_eyre::eyre::eyre!("LOD chunk has unsupported tier {side_cells}"))
+}
+
+fn parse_source_cells(value: &str) -> Result<Vec<[i32; 2]>> {
+    color_eyre::eyre::ensure!(!value.is_empty(), "source_cells is empty");
+    let mut seen = BTreeSet::new();
+    let mut cells = Vec::new();
+    for pair in value.split(';') {
+        let (x, y) = pair
+            .split_once(',')
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected x,y cell coordinate, got {pair:?}"))?;
+        let cell = [
+            x.parse::<i32>()
+                .wrap_err_with(|| format!("invalid source cell X coordinate {x:?}"))?,
+            y.parse::<i32>()
+                .wrap_err_with(|| format!("invalid source cell Y coordinate {y:?}"))?,
+        ];
+        color_eyre::eyre::ensure!(seen.insert(cell), "duplicate source cell {cell:?}");
+        cells.push(cell);
+    }
+    Ok(cells)
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// The reference columns [`map_reference`] reads, in order: the placement itself and the base
@@ -565,6 +1006,23 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lod_query_classification_preserves_transient_sqlite_causes_through_context() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_IOERR,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let wrapped = color_eyre::Report::from(error).wrap_err("query context");
+            assert!(LodQueryFailure::from_error(wrapped).transient);
+        }
+        assert!(
+            !LodQueryFailure::from_error(color_eyre::eyre::eyre!("invalid LOD path")).transient
+        );
+        assert!(!LodQueryFailure::from_error(rusqlite::Error::InvalidQuery.into()).transient);
+    }
+
     /// `load_cell` with the reference query built for `connection` as it is now, the way the
     /// worker builds it when it opens a database.
     fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
@@ -580,7 +1038,7 @@ mod tests {
         connection
             .execute_batch(
                 r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info VALUES(4);
+                INSERT INTO schema_info VALUES(5);
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -594,6 +1052,211 @@ mod tests {
                 INSERT INTO exterior_spatial VALUES(31,8250,8250,-12150,-12150,55,55,99,60);"#,
             )
             .unwrap();
+    }
+
+    fn lod_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,lod_origin_x INTEGER,lod_origin_y INTEGER);
+                 CREATE TABLE lod_build(id INTEGER PRIMARY KEY,build_identity TEXT NOT NULL);
+                 CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+                 CREATE VIRTUAL TABLE lod_chunks_spatial USING rtree(
+                    id,minX,maxX,minY,maxY,+worldspace_id,+tier,+anchor_x,+anchor_y);
+                 INSERT INTO worldspaces VALUES(60,-8,12);",
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO lod_build VALUES(1,?1)", ["a".repeat(64)])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks VALUES(60,4,-1,2,'lod/0000003c/4/cell_-1_2.glb',?1,\
+                 -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20;-11,20')",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks_spatial VALUES(1,-50000.0,-40000.0,50000.0,60000.0,60,4,-1,2)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks VALUES(60,8,-1,2,'lod/0000003c/8/cell_-1_2.glb',?1,\
+                 -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20')",
+                ["c".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks_spatial VALUES(2,-50000.0,-40000.0,50000.0,60000.0,60,8,-1,2)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks VALUES(61,4,-1,2,'lod/0000003d/4/cell_-1_2.glb',?1,\
+                 -50000.0,50000.0,0.0,-40000.0,60000.0,100.0,'-12,20')",
+                ["d".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_chunks_spatial VALUES(3,-50000.0,-40000.0,50000.0,60000.0,61,4,-1,2)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn lod_query(min: [f64; 2], max: [f64; 2]) -> LodChunkQuery {
+        LodChunkQuery {
+            worldspace_id: 60,
+            tier: LodTier::Tier4,
+            bounds_min: min,
+            bounds_max: max,
+        }
+    }
+
+    fn lod_build_contract_fixture(path: &Path, chunks: u32, identity: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES(5);
+                 CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);
+                 CREATE TABLE lod_build(id INTEGER PRIMARY KEY,build_identity TEXT NOT NULL);",
+            )
+            .unwrap();
+        for id in 0..chunks {
+            connection
+                .execute("INSERT INTO lod_chunks(id) VALUES(?1)", [id])
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO lod_build(id,build_identity) VALUES(1,?1)",
+                [identity],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_databases_render_without_lod_but_cannot_advertise_lod() {
+        for version in [3, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+            connection.execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({version});"
+            )).unwrap();
+            assert!(
+                load_lod_chunks(&connection, lod_query([0.0, 0.0], [1.0, 1.0]))
+                    .unwrap()
+                    .is_empty()
+            );
+            validate_lod_build_contract(directory.path(), 17).unwrap();
+            std::fs::write(directory.path().join("lod-manifest.json"), b"{}").unwrap();
+            assert!(validate_lod_build_contract(directory.path(), 17).is_err());
+        }
+    }
+
+    #[test]
+    fn current_database_requires_lod_tables_even_without_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(5);"
+        ).unwrap();
+        assert!(load_lod_chunks(&connection, lod_query([0.0, 0.0], [1.0, 1.0])).is_err());
+        assert!(validate_lod_build_contract(directory.path(), 17).is_err());
+    }
+
+    #[test]
+    fn worlds_without_compiled_chunks_do_not_require_lod_origins() {
+        let connection = Connection::open_in_memory().unwrap();
+        lod_fixture(&connection);
+        let mut query = lod_query([0.0, 0.0], [1.0, 1.0]);
+        query.worldspace_id = 99;
+        assert!(load_lod_chunks(&connection, query).unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_database_queue_rejects_lod_queries_without_blocking() {
+        let (requests, _receiver) = bounded(1);
+        requests.send(DatabaseRequest::Shutdown).unwrap();
+        let error = enqueue_lod_query(&requests, 1, lod_query([0.0, 0.0], [1.0, 1.0]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("queue is full"), "{error}");
+    }
+
+    #[test]
+    fn runtime_lod_contract_rejects_missing_mixed_and_incomplete_manifests() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = "a".repeat(64);
+        let database = directory.path().join("skyrim_world.db");
+        lod_build_contract_fixture(&database, 1, &identity);
+        let manifest_path = directory.path().join("lod-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "build_identity": identity,
+                "converter_schema": 16,
+                "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
+                "world_database_schema": 5,
+                "chunks": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        validate_lod_build_contract(directory.path(), 16).unwrap();
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut stale = current.clone();
+        stale["land_texture_repeats_per_cell"] = serde_json::json!(8.0);
+        std::fs::write(&manifest_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(
+            validate_lod_build_contract(directory.path(), 16)
+                .unwrap_err()
+                .to_string()
+                .contains("texture scale is stale")
+        );
+        std::fs::write(&manifest_path, serde_json::to_vec(&current).unwrap()).unwrap();
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE lod_build SET build_identity=?1 WHERE id=1",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+        let error = validate_lod_build_contract(directory.path(), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identities do not match"), "{error}");
+
+        std::fs::remove_file(&manifest_path).unwrap();
+        let error = validate_lod_build_contract(directory.path(), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lod-manifest.json is missing"), "{error}");
+    }
+
+    #[test]
+    fn runtime_lod_contract_allows_a_world_with_no_compiled_chunks() {
+        let directory = tempfile::tempdir().unwrap();
+        lod_build_contract_fixture(
+            &directory.path().join("skyrim_world.db"),
+            0,
+            &"a".repeat(64),
+        );
+        validate_lod_build_contract(directory.path(), 16).unwrap();
     }
 
     #[test]
@@ -624,6 +1287,114 @@ mod tests {
             Some("architecture/wall.nif")
         );
         assert_eq!(payload.references[0].bounds_max, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn lod_query_uses_world_space_overlap_and_returns_validated_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        lod_fixture(&connection);
+
+        let chunks = load_lod_chunks(
+            &connection,
+            lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(
+            chunk.key,
+            ChunkKey::new(60, LodTier::Tier4, ChunkAnchor::new(-1, 2))
+        );
+        assert_eq!(chunk.payload_path, "lod/0000003c/4/cell_-1_2.glb");
+        assert_eq!(chunk.content_hash, "b".repeat(64));
+        assert_eq!(chunk.build_identity, "a".repeat(64));
+        assert_eq!(chunk.origin, LodOrigin::new(-8, 12));
+        assert_eq!(chunk.bounds.min, [-50000.0, 50000.0, 0.0]);
+        assert_eq!(chunk.bounds.max, [-40000.0, 60000.0, 100.0]);
+        assert_eq!(chunk.source_cells, vec![[-12, 20], [-11, 20]]);
+
+        let misses = load_lod_chunks(&connection, lod_query([0.0, 0.0], [10.0, 10.0])).unwrap();
+        assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn lod_query_rejects_malformed_tier_path_bounds_and_query_aabb() {
+        assert!(lod_tier_from_database(3).is_err());
+
+        let connection = Connection::open_in_memory().unwrap();
+        lod_fixture(&connection);
+        connection
+            .execute(
+                "UPDATE lod_chunks SET payload_path='../outside.glb' WHERE worldspace_id=60",
+                [],
+            )
+            .unwrap();
+        let error = load_lod_chunks(
+            &connection,
+            lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unsafe or non-canonical payload path"),
+            "{error}"
+        );
+
+        connection
+            .execute(
+                "UPDATE lod_chunks SET payload_path='lod/0000003c/4/cell_-1_2.glb',bounds_max_x=-60000.0 \
+                 WHERE worldspace_id=60",
+                [],
+            )
+            .unwrap();
+        let error = load_lod_chunks(
+            &connection,
+            lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unordered world-space bounds"), "{error}");
+
+        let error = load_lod_chunks(&connection, lod_query([f64::NAN, 0.0], [1.0, 1.0]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("non-finite or unordered X bounds"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lod_query_rejects_missing_origin_and_invalid_source_cells() {
+        let connection = Connection::open_in_memory().unwrap();
+        lod_fixture(&connection);
+        connection
+            .execute("UPDATE worldspaces SET lod_origin_x=NULL WHERE id=60", [])
+            .unwrap();
+        let error = load_lod_chunks(
+            &connection,
+            lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no valid X origin"), "{error}");
+
+        connection
+            .execute("UPDATE worldspaces SET lod_origin_x=-8 WHERE id=60", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE lod_chunks SET source_cells='not-a-cell' WHERE worldspace_id=60",
+                [],
+            )
+            .unwrap();
+        let error = load_lod_chunks(
+            &connection,
+            lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid source_cells metadata"), "{error}");
     }
 
     #[test]
@@ -850,7 +1621,10 @@ mod tests {
         .unwrap();
         assert_eq!(payload.references.len(), 2);
         connection
-            .execute("UPDATE schema_info SET version=5", [])
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION + 1],
+            )
             .unwrap();
         drop(connection);
         assert!(validate(&path).is_err());
@@ -893,6 +1667,7 @@ mod tests {
         let path = directory.path().join("missing.db");
         let (request_tx, request_rx) = bounded(4);
         let (response_tx, response_rx) = unbounded();
+        let (lod_response_tx, _lod_response_rx) = unbounded();
         let key = CellKey::Interior(99);
         for generation in 0..2 {
             request_tx
@@ -905,7 +1680,7 @@ mod tests {
         }
         request_tx.send(DatabaseRequest::Shutdown).unwrap();
 
-        worker(path, request_rx, response_tx);
+        worker(path, request_rx, response_tx, lod_response_tx);
 
         let responses: Vec<DatabaseResponse> = response_rx.try_iter().collect();
         assert_eq!(responses.len(), 2, "every request is answered");
@@ -915,6 +1690,35 @@ mod tests {
                 .expect_err("the cell fails instead of loading");
             assert!(error.contains("is unusable"), "{error}");
         }
+    }
+
+    #[test]
+    fn lod_worker_preserves_generation_on_its_distinct_response_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        lod_fixture(&connection);
+        drop(connection);
+
+        let (request_tx, request_rx) = bounded(2);
+        let (cell_response_tx, cell_response_rx) = unbounded();
+        let (lod_response_tx, lod_response_rx) = unbounded();
+        request_tx
+            .send(DatabaseRequest::LoadLodChunks {
+                generation: 7,
+                query: lod_query([-46000.0, 54000.0], [-45000.0, 55000.0]),
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        request_tx.send(DatabaseRequest::Shutdown).unwrap();
+
+        worker(path, request_rx, cell_response_tx, lod_response_tx);
+
+        let response = lod_response_rx.try_recv().unwrap();
+        assert_eq!(response.generation, 7);
+        assert_eq!(response.chunk_count, 1);
+        assert_eq!(response.result.unwrap().len(), 1);
+        assert!(cell_response_rx.try_recv().is_err());
     }
 
     #[test]

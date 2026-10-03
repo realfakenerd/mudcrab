@@ -11,6 +11,7 @@ pub enum AssetKind {
     Texture,
     Mesh,
     Script,
+    LodSettings,
 }
 
 impl AssetKind {
@@ -19,6 +20,7 @@ impl AssetKind {
             Self::Texture => "textures",
             Self::Mesh => "meshes",
             Self::Script => "scripts",
+            Self::LodSettings => "lodsettings",
         }
     }
 
@@ -27,6 +29,7 @@ impl AssetKind {
             Self::Texture => &["dds", "ktx2"],
             Self::Mesh => &["nif", "glb"],
             Self::Script => &["pex", "luau"],
+            Self::LodSettings => &["lod"],
         }
     }
 }

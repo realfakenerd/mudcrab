@@ -90,7 +90,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
-         INSERT INTO schema_info(version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
+         INSERT INTO schema_info(version) SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
          CREATE TABLE IF NOT EXISTS plugins (
              id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, priority INTEGER NOT NULL, checksum BLOB NOT NULL
          );
@@ -101,7 +101,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_records_type ON records(record_type);
          CREATE INDEX IF NOT EXISTS idx_records_cell_id ON records(cell_id) WHERE cell_id IS NOT NULL;
          CREATE TABLE IF NOT EXISTS worldspaces (
-             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL, parent_world INTEGER, flags INTEGER NOT NULL
+             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL, parent_world INTEGER, flags INTEGER NOT NULL,
+             lod_origin_x INTEGER, lod_origin_y INTEGER
          );
          CREATE TABLE IF NOT EXISTS cells (
              id INTEGER PRIMARY KEY, worldspace_id INTEGER, grid_x INTEGER, grid_y INTEGER,
@@ -114,7 +115,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
              local_x REAL, local_y REAL, rot_x REAL NOT NULL, rot_y REAL NOT NULL,
              rot_z REAL NOT NULL, scale REAL NOT NULL DEFAULT 1.0,
-             radius_override REAL, data BLOB
+             radius_override REAL, header_flags INTEGER NOT NULL DEFAULT 0,
+             enable_parent_id INTEGER, enable_parent_flags INTEGER, data BLOB
          );
          CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
          CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
@@ -164,6 +166,21 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS lod (
              cell_id INTEGER NOT NULL, lod_level INTEGER NOT NULL, mesh_data BLOB NOT NULL,
              PRIMARY KEY (cell_id, lod_level)
+         );
+         CREATE TABLE IF NOT EXISTS lod_chunks (
+             worldspace_id INTEGER NOT NULL, tier INTEGER NOT NULL,
+             anchor_x INTEGER NOT NULL, anchor_y INTEGER NOT NULL,
+             payload_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+             bounds_min_x REAL NOT NULL, bounds_min_y REAL NOT NULL, bounds_min_z REAL NOT NULL,
+             bounds_max_x REAL NOT NULL, bounds_max_y REAL NOT NULL, bounds_max_z REAL NOT NULL,
+             source_cells TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (worldspace_id, tier, anchor_x, anchor_y)
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS lod_chunks_spatial USING rtree(
+             id, minX, maxX, minY, maxY, +worldspace_id, +tier, +anchor_x, +anchor_y
+         );
+         CREATE TABLE IF NOT EXISTS lod_build (
+             id INTEGER PRIMARY KEY CHECK (id = 1), build_identity TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS waters (
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
@@ -301,6 +318,7 @@ fn export_records(
                     form_id,
                     cell_id,
                     cells.get(&cell_id).copied(),
+                    record.flags,
                     &record.subrecords,
                 )?;
             }
@@ -546,6 +564,7 @@ pub fn insert_reference(
     form_id: u32,
     cell_id: u32,
     cell: Option<CellMetadata>,
+    header_flags: u32,
     subs: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
     let view = SubrecordView::new(subs);
@@ -585,11 +604,21 @@ pub fn insert_reference(
         .find(b"XRDS")
         .filter(|bytes| bytes.len() >= 4)
         .map(|bytes| f32::from_le_bytes(bytes[..4].try_into().expect("four-byte XRDS radius")));
+    let (enable_parent_id, enable_parent_flags) = view
+        .find(b"XESP")
+        .filter(|bytes| bytes.len() >= 8)
+        .map(|bytes| {
+            (
+                u32::from_le_bytes(bytes[..4].try_into().expect("four-byte XESP parent")),
+                u32::from_le_bytes(bytes[4..8].try_into().expect("four-byte XESP flags")),
+            )
+        })
+        .unzip();
 
     tx.execute(
-        "INSERT OR REPLACE INTO \"references\"(id, cell_id, worldspace_id, base_form_id, is_exterior, pos_x, pos_y, pos_z, local_x, local_y, rot_x, rot_y, rot_z, scale, radius_override, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, blob],
+        "INSERT OR REPLACE INTO \"references\"(id, cell_id, worldspace_id, base_form_id, is_exterior, pos_x, pos_y, pos_z, local_x, local_y, rot_x, rot_y, rot_z, scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, blob],
     )?;
     if is_exterior {
         tx.execute("INSERT OR REPLACE INTO exterior_spatial(id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id) VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6)", params![form_id, pos[0], pos[1], pos[2], cell_id, worldspace_id])?;
@@ -1008,6 +1037,7 @@ mod tests {
             0xE7F,
             1,
             Some((None, None, Some(0x3C))),
+            0,
             &[(b"DATA".to_vec(), data)],
         )
         .unwrap();

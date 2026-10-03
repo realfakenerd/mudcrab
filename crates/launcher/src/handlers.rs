@@ -228,6 +228,8 @@ mod tests {
             cache_hits: 0,
             skipped: 0,
             warnings: Vec::new(),
+            lod_chunks: 0,
+            lod_warnings: Vec::new(),
             artifacts: 1,
             elapsed: Duration::from_secs(1),
         });

@@ -30,8 +30,10 @@ fn preset_plugin() -> Vec<u8> {
 fn generate_interior_data(root: &Path) {
     layout::prepare_directory(root, false).unwrap();
     let mut formats = layout::Formats::all();
-    // The preset replaces `Skyrim.esm`, as `run_gen` arranges.
+    // The preset replaces `Skyrim.esm`, as `run_gen` arranges; the sidecar
+    // requires the stock plugin, so it goes with it.
     formats.esm = false;
+    formats.lodsettings = false;
     layout::generate(root, layout::DEFAULT_SEED, formats).unwrap();
     layout::write_plugin(root, &preset_plugin()).unwrap();
 }

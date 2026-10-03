@@ -154,6 +154,9 @@ expression: snapshot
       "data": {
         "encoded_bytes": 60
       },
+      "enable_parent_flags": null,
+      "enable_parent_id": null,
+      "header_flags": 0,
       "id": 18,
       "is_exterior": 1,
       "local_x": 2048.0,
@@ -174,6 +177,9 @@ expression: snapshot
       "data": {
         "encoded_bytes": 104
       },
+      "enable_parent_flags": null,
+      "enable_parent_id": null,
+      "header_flags": 0,
       "id": 19,
       "is_exterior": 1,
       "local_x": 2048.0,
@@ -194,6 +200,9 @@ expression: snapshot
       "data": {
         "encoded_bytes": 104
       },
+      "enable_parent_flags": null,
+      "enable_parent_id": null,
+      "header_flags": 0,
       "id": 65537,
       "is_exterior": 0,
       "local_x": null,
@@ -269,6 +278,8 @@ expression: snapshot
       "editor_id": "GeneratedWorld",
       "flags": 0,
       "id": 1,
+      "lod_origin_x": null,
+      "lod_origin_y": null,
       "parent_world": null
     }
   ]

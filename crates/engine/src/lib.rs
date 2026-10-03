@@ -9,6 +9,7 @@ pub mod render;
 pub mod render_timing;
 pub mod shots;
 pub mod sky;
+pub mod skyrim_ini;
 pub mod streaming;
 pub mod world;
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Riverwood package launcher (schema 4, terrain physics, V walk, T tankard, E pickup).
+# Fiji Riverwood package launcher; package reports specify schema and test scope.
 # Bundled models and textures cover a six-cell radius around grid (5, -12).
 dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -r "$dir/lib/libdl.so.2" ]; then
