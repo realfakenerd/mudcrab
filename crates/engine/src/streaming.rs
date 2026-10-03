@@ -1244,7 +1244,8 @@ fn authored_collision_from_hierarchy(
             if let Some(collision) = value.get("openSkyrimCollision") {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
-                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
+                {
                     return Err("unsupported GLB collision contract".to_owned());
                 }
                 return Ok(Some(asset));
@@ -3261,6 +3262,7 @@ mod tests {
                 })
                 .into(),
             skipped: Vec::new(),
+            bodies: Vec::new(),
         };
         let parts = collider_parts_from_authored(&asset).unwrap();
         let root = app
@@ -3332,6 +3334,7 @@ mod tests {
                 authored: true,
                 shapes,
                 skipped: Vec::new(),
+                bodies: Vec::new(),
             };
             app.world_mut().spawn((
                 GltfSceneExtras {

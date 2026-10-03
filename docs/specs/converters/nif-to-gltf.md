@@ -145,3 +145,45 @@ impl NifToGltfConverter {
     }
 }
 ```
+
+## 6. Collision extras and rigid-body dynamics
+
+Scene extras carry `openSkyrimCollision` (`shared::collision::CollisionAsset`): the authored
+collision `shapes`, the `skipped` blocks, and, since version 2, a `bodies` array (#104 phase a).
+A version 1 asset has no `bodies`; readers treat every shape in it as fixed and ignore body
+fields they do not know.
+
+Each `bhkCollisionObject` whose rigid body (`bhkRigidBody` or `bhkRigidBodyT`) yields shapes
+produces one `CollisionBody`:
+
+| Field | Source (byte offset in the Skyrim SE body block) | Conversion |
+| --- | --- | --- |
+| `node`, `target` | the collision object's target `NiNode` | glTF node index and NIF node name |
+| `shapes` | the shapes extracted for this body | indices into `shapes` |
+| `havok.collision_layer` | havok filter layer (4) | raw |
+| `havok.motion_system`, `deactivator_type`, `quality_type` | 224, 225, 227 | raw (`hkMotionType`, `hkDeactivatorType`, `hkQualityType`) |
+| `mass` | 180 | unchanged (kg) |
+| `inertia` | `hkMatrix3`, three rows of four floats (116) | R I R^T for the shapes' transform, x 70^2, then the Creation-to-runtime basis |
+| `center_of_mass` | `Vector4` (164) | x 70, same transform as the shapes, then the runtime basis |
+| `linear_damping`, `angular_damping` | 184, 188 | unchanged |
+| `friction`, `restitution` | 200, 208 | unchanged |
+| `max_linear_velocity` | 212 | x 70 |
+| `max_angular_velocity` | 216 | unchanged (rad/s) |
+
+`kind` is `dynamic` when the motion system is a simulated one (dynamic, sphere or box inertia,
+plain or stabilized, thin box: 1, 2, 3, 4, 5, 8), the quality type is a moving one (debris,
+moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `keyframed` for
+`MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true only when every shape of
+the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported and skipped).
+
+The `node` index and `target` name are checked against the GLB that is actually written, not the
+source NIF's static node list (skeletal and effect NIFs lay their nodes out differently): a body
+is kept only when `target` is non-empty and the GLB's node at `node` has that name. A name
+used by more than one node is trusted at its index only when the GLB's nodes start in the
+same order as the NIF's static scene, which the index was predicted from; otherwise, and
+always when the collision is added to a GLB built elsewhere (`annotate`), the name must be
+unique. A body that fails is listed in `skipped`. A body whose shapes or dynamics cannot be read
+is likewise listed in `skipped`; in every case its shapes stay as fixed collision.
+
+There is no converter schema bump: conversions made before this change keep their cached GLBs,
+which have no `bodies`, until they are reconverted.
