@@ -26,6 +26,7 @@ sha2.workspace = true
 walkdir.workspace = true
 lz4_flex.workspace = true
 image_dds.workspace = true
+intel_tex_2 = "0.2.2"
 ktx2.workspace = true
 project-wormhole-nif.workspace = true
 project-wormhole-shared = "0.1.0"

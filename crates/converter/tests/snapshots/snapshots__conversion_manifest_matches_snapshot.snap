@@ -91,7 +91,7 @@ expression: manifest
     "textures/generated_color_x8.dds": {
       "output": "textures/generated_color_x8.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 1785,
+      "output_size": 1753,
       "source_hash": "[source_hash]"
     },
     "textures/generated_cube.dds": {

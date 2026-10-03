@@ -39,8 +39,8 @@ mod astc_tables;
 mod ktx2;
 
 use crate::texture::{
-    TextureEncoding, decode_x8r8g8b8_mips, inspect_ktx2, max_mip_levels, preserves_native_blocks,
-    supercompress_ktx2_levels,
+    TextureEncoding, decode_packed_rgba8_mips, decode_x8r8g8b8_mips, inspect_ktx2, max_mip_levels,
+    preserves_native_blocks, supercompress_ktx2_levels,
 };
 use color_eyre::{
     Report, Result,
@@ -103,7 +103,7 @@ pub(crate) fn cache_label(quality: u32) -> String {
 /// `FMT_*` constants in `uastc_encode.wgsl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-enum SourceFormat {
+pub(crate) enum SourceFormat {
     Rgba8 = 0,
     Bgra8 = 1,
     /// X8R8G8B8: alpha is forced to 255.
@@ -123,10 +123,10 @@ impl SourceFormat {
 
 /// One mip level of one face, as stored in `PreparedTexture::upload`.
 #[derive(Debug, Clone)]
-struct SourceImage {
+pub(crate) struct SourceImage {
     width: u32,
     height: u32,
-    format: SourceFormat,
+    pub(crate) format: SourceFormat,
     /// Byte offset in the texture's upload bytes.
     offset: usize,
     /// Bytes per texel row.
@@ -186,7 +186,7 @@ pub(crate) struct PreparedTexture {
     height: u32,
     faces: u32,
     /// `images[mip * faces + face]`.
-    images: Vec<SourceImage>,
+    pub(crate) images: Vec<SourceImage>,
     /// Exactly the bytes to upload, so the queue's byte budget counts
     /// everything a queued texture holds.
     bytes: Vec<u8>,
@@ -194,7 +194,7 @@ pub(crate) struct PreparedTexture {
 
 impl PreparedTexture {
     /// Bytes to upload (the DDS payload, or RGBA for CPU-decoded formats).
-    fn upload(&self) -> &[u8] {
+    pub(crate) fn upload(&self) -> &[u8] {
         &self.bytes
     }
 
@@ -225,6 +225,12 @@ impl PreparedTexture {
             // A truncated payload is left to the CPU decoder, which decides what is usable.
             && let Some(data_end) = data_start.checked_add(len)
             && data_end <= bytes.len()
+            // 24-bit rows may be DWORD-aligned, which `stored_layout` does not
+            // model: only a chain of exactly the tight size (and a header pitch
+            // that agrees) is read in place; the rest goes through the CPU decoder.
+            && (format != SourceFormat::Bgr8
+                || (data_end == bytes.len()
+                    && dds.header.pitch.is_none_or(|pitch| pitch == face_major[0].pitch)))
         {
             // KTX2 wants mip-major order: every face of mip 0 first.
             let images = (0..mips)
@@ -378,6 +384,16 @@ struct DecodedTexture {
 fn decode_dds_rgba(bytes: &[u8]) -> Result<DecodedTexture> {
     let dds = Dds::read(Cursor::new(bytes)).map_err(|error| eyre!("invalid DDS: {error}"))?;
     let faces = if is_cubemap(&dds) { 6 } else { 1 };
+    if dds.get_d3d_format() == Some(D3DFormat::R8G8B8) {
+        // `image_dds` assumes tight rows; the packed decoder also reads DWORD-aligned ones.
+        ensure!(faces == 1, "24-bit cubemaps use the CPU encoder");
+        return Ok(DecodedTexture {
+            width: dds.get_width(),
+            height: dds.get_height(),
+            faces: 1,
+            pixels: decode_packed_rgba8_mips(&dds)?,
+        });
+    }
     if dds.get_d3d_format() == Some(D3DFormat::X8R8G8B8) {
         ensure!(faces == 1, "X8R8G8B8 cubemaps use the CPU encoder");
         return Ok(DecodedTexture {
@@ -1413,8 +1429,18 @@ mod tests {
             for (index, texel) in dds[128..].chunks_mut(4).enumerate() {
                 texel.copy_from_slice(&[index as u8 * 4, 64, 255 - index as u8, alpha]);
             }
-            let cpu =
-                crate::texture::TextureConverter::convert_uncompressed(&dds, encoding).unwrap();
+            // The CPU default block-compresses uncompressed RGBA to native BC,
+            // so the UASTC reference is encoded from the decoded surface.
+            let surface =
+                image_dds::SurfaceRgba8::decode_dds(&Dds::read(Cursor::new(&dds[..])).unwrap())
+                    .unwrap();
+            let cpu = crate::texture::encode_2d_surface(
+                &surface,
+                encoding,
+                crate::texture::ETC1S_QUALITY_DEFAULT,
+                crate::texture::UASTC_LEVEL_DEFAULT,
+            )
+            .unwrap();
             let gpu = ktx2::write_uastc(
                 8,
                 8,
